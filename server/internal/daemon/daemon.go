@@ -3227,6 +3227,7 @@ func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
 // here fall back to capitalizing the key (claude → "Claude", codex → "Codex").
 var runtimeDisplayNameOverrides = map[string]string{
 	"traecli": "Trae",
+	"cline":   "Cline",
 }
 
 // providerDisplayName returns the human-facing runtime name for a provider key.
@@ -3242,7 +3243,9 @@ func providerDisplayName(name string) string {
 
 func providerNeedsInlineSystemPrompt(provider string) bool {
 	switch provider {
-	case "openclaw", "kiro", "kimi", "traecli":
+	case "openclaw", "kiro", "kimi", "traecli", "cline":
+		// cline: -s / --system is unusable on the internal CLI; the backend
+		// prepends ExecOptions.SystemPrompt into the user prompt arg instead.
 		return true
 	default:
 		return false

@@ -1,6 +1,6 @@
 # Cline 3.x NDJSON → Multica Adapter Plan
 
-**Status:** Agreed design (not yet implemented)  
+**Status:** Implemented (Cline 3.x NDJSON Backend + daemon probe + migration 175)  
 **Scope:** Adapt a Cline-based internal coding CLI to Multica via **`--json` NDJSON (形态 B / Cline 3.x)**  
 **Out of scope:** ACP (`--acp`), Codex-style JSON-RPC app-server, upstream contribution process  
 
@@ -244,4 +244,4 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 
 ## 12. Next step after this doc
 
-Implement §8.1 on the fork branch, using §6 mapping and §5 launch contract as the source of truth. Update this file’s **Status** line when implementation lands or decisions change.
+§8.1 is implemented on the fork branch (`server/pkg/agent/cline.go`, daemon probe, migration `175_runtime_profile_add_cline`). Use §5–§6 as the source of truth when changing behavior; update this file’s **Status** line and decision log when decisions change.

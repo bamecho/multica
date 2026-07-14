@@ -160,6 +160,10 @@ func ListModels(ctx context.Context, providerType, executablePath string) ([]Mod
 			annotateCodebuddyThinking(ctx, models, executablePath)
 			return models, nil
 		})
+	case "cline":
+		// Cline 3.x NDJSON path: no dynamic model catalog in v1. Empty list
+		// lets the UI offer manual model entry; the backend passes -m when set.
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown agent type: %q", providerType)
 	}

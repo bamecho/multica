@@ -1,6 +1,6 @@
 // Package agent provides a unified interface for executing prompts via
 // coding agents (Claude Code, CodeBuddy, Codex, Copilot, OpenCode, OpenClaw,
-// Hermes, Pi, Cursor, Kimi, Kiro, Antigravity, Qoder). It mirrors the
+// Hermes, Pi, Cursor, Kimi, Kiro, Antigravity, Qoder, Trae, Cline). It mirrors the
 // happy-cli AgentBackend pattern, translated to idiomatic Go.
 package agent
 
@@ -137,18 +137,21 @@ type Config struct {
 }
 
 // New creates a Backend for the given agent type.
-// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "openclaw", "hermes", "pi", "cursor", "kimi", "kiro", "antigravity", "qoder", "traecli".
+// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "openclaw", "hermes", "pi", "cursor", "kimi", "kiro", "antigravity", "qoder", "traecli", "cline".
 //
 // SupportedTypes is the canonical whitelist of agent types eligible to back a
 // custom runtime profile. It MUST stay in lockstep with the
 // runtime_profile.protocol_family CHECK constraint (migration 120, widened by
-// migration 134 to add qoder and migration 136 to add traecli): a custom
-// runtime profile may only be based on a backend Multica officially supports.
+// migration 134 to add qoder, migration 136 to add traecli, and migration 175
+// to add cline): a custom runtime profile may only be based on a backend Multica
+// officially supports.
 // qoder is exposed here so Qoder CN (`qoderclicn`) users can point the Qoder
 // backend at a non-default binary instead of misrouting through Kiro/ACP with
 // incompatible arguments (#4883). traecli (Trae) has a New backend, launch
 // header and provider branding but was previously missing from this whitelist,
-// so the family picker rejected it (#4945).
+// so the family picker rejected it (#4945). cline is the Cline 3.x NDJSON
+// (形态 B) family used for open-source `cline` and internal renamed binaries
+// via Custom Runtime Profile (docs/cline-ndjson-multica-adapter-plan.md).
 var SupportedTypes = []string{
 	"claude",
 	"codebuddy",
@@ -164,6 +167,7 @@ var SupportedTypes = []string{
 	"antigravity",
 	"qoder",
 	"traecli",
+	"cline",
 }
 
 // IsSupportedType reports whether agentType is in the SupportedTypes whitelist.
@@ -212,8 +216,10 @@ func New(agentType string, cfg Config) (Backend, error) {
 		return &qoderBackend{cfg: cfg}, nil
 	case "traecli":
 		return &traecliBackend{cfg: cfg}, nil
+	case "cline":
+		return &clineBackend{cfg: cfg}, nil
 	default:
-		return nil, fmt.Errorf("unknown agent type: %q (supported: claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, kiro, antigravity, qoder, traecli)", agentType)
+		return nil, fmt.Errorf("unknown agent type: %q (supported: claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, kiro, antigravity, qoder, traecli, cline)", agentType)
 	}
 }
 
@@ -243,6 +249,7 @@ var launchHeaders = map[string]string{
 	"pi":          "pi (json mode)",
 	"qoder":       "qodercli --acp",
 	"traecli":     "traecli acp serve",
+	"cline":       "cline --json (ndjson)",
 }
 
 // LaunchHeader returns the user-visible launch skeleton for agentType, or an
