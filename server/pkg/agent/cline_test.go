@@ -401,22 +401,22 @@ func TestListModelsClineEmptyCatalog(t *testing.T) {
 }
 
 // TestClineMigrationWhitelistMentionsProvider is a structural guard so the
-// SupportedTypes lockstep set and migration 179 stay aligned for `cline`.
+// SupportedTypes lockstep set and migration 9001 stay aligned for `cline`.
 func TestClineMigrationWhitelistMentionsProvider(t *testing.T) {
 	t.Parallel()
 	// migrations live at server/migrations relative to this package's module root.
-	path := filepath.Join("..", "..", "migrations", "179_runtime_profile_add_cline.up.sql")
+	path := filepath.Join("..", "..", "migrations", "9001_runtime_profile_add_cline.up.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}
 	body := string(raw)
 	if !strings.Contains(body, "'cline'") {
-		t.Fatalf("migration 179 must list 'cline' in protocol_family CHECK:\n%s", body)
+		t.Fatalf("migration 9001 must list 'cline' in protocol_family CHECK:\n%s", body)
 	}
 	for _, keep := range []string{"'claude'", "'traecli'", "'qoder'", "'deveco'"} {
 		if !strings.Contains(body, keep) {
-			t.Errorf("migration 179 missing prior family %s", keep)
+			t.Errorf("migration 9001 missing prior family %s", keep)
 		}
 	}
 }

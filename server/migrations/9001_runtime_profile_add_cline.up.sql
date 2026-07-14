@@ -5,6 +5,10 @@ ALTER TABLE runtime_profile DROP CONSTRAINT IF EXISTS runtime_profile_protocol_f
 -- command_name points at an internal Cline-compatible binary. NOT VALID mirrors
 -- migrations 126/134/136/175 so a historical Gemini row they intentionally
 -- tolerated does not block the upgrade. Includes `deveco` from migration 175.
+--
+-- Numbered 9001 (fork-high range) so long-lived fork merges with upstream do
+-- not keep colliding with sequential upstream prefixes; renumber to the next
+-- sequential id only if/when this lands on multica-ai/multica.
 ALTER TABLE runtime_profile ADD CONSTRAINT runtime_profile_protocol_family_check
     CHECK (protocol_family IN (
         'claude',

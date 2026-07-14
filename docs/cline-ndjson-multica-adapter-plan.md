@@ -245,4 +245,4 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 
 ## 12. Next step after this doc
 
-§8.1 is implemented on the fork branch (`server/pkg/agent/cline.go`, daemon probe, migration `179_runtime_profile_add_cline`). Use §5–§6 as the source of truth when changing behavior; update this file’s **Status** line and decision log when decisions change.
+§8.1 is implemented on the fork branch (`server/pkg/agent/cline.go`, daemon probe, migration `9001_runtime_profile_add_cline`). Use §5–§6 as the source of truth when changing behavior; update this file’s **Status** line and decision log when decisions change.
