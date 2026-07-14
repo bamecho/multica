@@ -71,3 +71,7 @@ server/server
 data/
 .kilo
 .idea
+
+# CLI release archives (publish via GitHub Releases; keep README only)
+releases/cli/*
+!releases/cli/README.md
