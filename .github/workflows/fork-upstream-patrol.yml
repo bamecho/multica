@@ -1,0 +1,108 @@
+# Fork-only early warning: community main vs a long-lived feature branch.
+# Never pushes, never opens PRs. See docs/fork-sync-patrol.md.
+name: Fork upstream patrol
+
+on:
+  schedule:
+    # Mondays 09:00 UTC
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      feature_ref:
+        description: "Feature branch or ref to compare against upstream/main"
+        required: true
+        default: "feat/cline-ndjson-adapter"
+      max_behind:
+        description: "Fail if feature is more than this many commits behind upstream"
+        required: false
+        default: "50"
+      run_tests:
+        description: "Run targeted Go tests (1 or 0)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-upstream-patrol-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  patrol:
+    name: Patrol feature vs upstream/main
+    runs-on: ubuntu-latest
+    # Scheduled runs only on forks. Manual dispatch always allowed (including
+    # accidental runs on the canonical repo — still read-only).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.repository_owner != 'multica-ai'
+    steps:
+      - name: Checkout feature ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # On schedule, default to the Cline adapter branch; override via dispatch.
+          ref: ${{ github.event.inputs.feature_ref || 'feat/cline-ndjson-adapter' }}
+
+      - name: Add community upstream remote
+        run: |
+          set -euo pipefail
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/multica-ai/multica.git
+          else
+            git remote add upstream https://github.com/multica-ai/multica.git
+          fi
+          git fetch upstream main --prune
+          git fetch origin --prune || true
+
+      - name: Setup Go
+        if: ${{ (github.event.inputs.run_tests || '1') == '1' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Run patrol script
+        env:
+          FEATURE_REF: HEAD
+          UPSTREAM_REMOTE: upstream
+          UPSTREAM_BRANCH: main
+          MAX_BEHIND: ${{ github.event.inputs.max_behind || '50' }}
+          RUN_TESTS: ${{ github.event.inputs.run_tests || '1' }}
+          FETCH: "0"
+          OUT_DIR: ${{ runner.temp }}/patrol
+          REPORT_FILE: ${{ runner.temp }}/patrol/fork-upstream-patrol-report.md
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUT_DIR}"
+          chmod +x scripts/fork-upstream-patrol.sh
+          # Exit 1 = attention needed → fail the job (visible red run).
+          ./scripts/fork-upstream-patrol.sh
+          cp -f "${REPORT_FILE}" "${GITHUB_WORKSPACE}/fork-upstream-patrol-report.md" || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-upstream-patrol-report
+          path: |
+            fork-upstream-patrol-report.md
+            ${{ runner.temp }}/patrol/fork-upstream-patrol-report.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Summarize for Actions UI
+        if: always()
+        run: |
+          set -euo pipefail
+          REPORT="${{ runner.temp }}/patrol/fork-upstream-patrol-report.md"
+          if [[ -f "$REPORT" ]]; then
+            {
+              echo "## Fork upstream patrol"
+              echo
+              cat "$REPORT"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No report file produced." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -58,6 +58,9 @@ apps/web/test-results/
 # feature tracking
 _features/
 
+# local output of scripts/fork-upstream-patrol.sh (see docs/fork-sync-patrol.md)
+fork-upstream-patrol-report.md
+
 # runtime
 *.pid
 

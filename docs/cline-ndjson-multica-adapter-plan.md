@@ -7,6 +7,7 @@
 Related:
 
 - Probe / capture cookbook: [`docs/cline-ndjson-probe.md`](./cline-ndjson-probe.md)
+- Fork long-lived branch sync patrol: [`docs/fork-sync-patrol.md`](./fork-sync-patrol.md)
 - Multica control plane: `server/internal/daemon/daemon.go` (`runTask`)
 - Backend contract: `server/pkg/agent/agent.go` (`Backend.Execute` → `Message` / `Result`)
 - Custom profiles: [`docs/custom-runtimes.md`](./custom-runtimes.md)
