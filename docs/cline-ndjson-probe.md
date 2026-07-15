@@ -42,38 +42,41 @@ Multica does not call the LLM. The daemon:
 Replace `your-cli` with the internal binary name.
 
 ```bash
-# Minimal headless NDJSON
+# Minimal headless NDJSON (human / probe)
 your-cli --json --auto-approve true \
   -c /path/to/workdir \
   -t 120 \
   "Your prompt here"
 
-# Optional Multica-aligned knobs (if supported by the fork)
-your-cli --json --auto-approve true \
-  -c "$WORKDIR" \
-  -t 600 \
-  -s "$SYSTEM_OR_BRIEF" \
+# Multica-shaped launch (matches server/pkg/agent/cline.go)
+# 1) Seed auth into data-dir first (sandbox ignores separate --config for providers):
+#    cp -a ~/.cline-sr/data/settings/. "$PER_TASK_STATE_DIR/settings/"
+#    mkdir -p "$PER_TASK_STATE_DIR/data/settings" && cp -a ~/.cline-sr/data/settings/. "$PER_TASK_STATE_DIR/data/settings/"
+printf '%s' "$FULL_MULTICA_PAYLOAD" | your-cli --json \
   --data-dir "$PER_TASK_STATE_DIR" \
-  --id "$PRIOR_SESSION_ID" \
+  -c "$WORKDIR" \
   -m "$MODEL" \
-  -P "$PROVIDER" \
-  "$PROMPT"
+  --id "$PRIOR_SESSION_ID" \
+  $'\n'
 ```
 
-Useful flags (open-source `cline --help`):
+Useful flags (open-source `cline --help` + Multica notes):
 
 | Flag | Role |
 | --- | --- |
 | `--json` | NDJSON instead of TUI |
-| `--auto-approve true\|false` | Tool auto-approval (often default `true`) |
+| `--auto-approve true\|false` | Tool auto-approval (often default `true`; Multica does not pass it) |
 | `-c, --cwd` | Working directory (= Multica task workdir) |
-| `-t, --timeout` | Seconds (`0` = no timeout) |
-| `-s, --system` | System prompt override |
+| `-t, --timeout` | Seconds (`0` = no timeout); Multica uses daemon wall-clock instead |
+| `-s, --system` | System prompt override; Multica does **not** use it (stdin brief) |
 | `--id` | Resume session |
-| `--data-dir` | Isolated local state (avoid global `~/.cline` crosstalk) |
+| `--data-dir` | Isolated local state; **enables sandbox** (providers read under data-dir) |
+| `--config` | Settings dir when not sandboxed; **does not fix providers under `--data-dir`** |
 | `-m` / `-P` / `-k` | Model / provider / API key |
 | `--thinking` | Reasoning effort |
 | `--acp` | **Do not use** for Multica NDJSON path |
+
+**Auth under `--data-dir`:** seed `providers.json` from `~/.cline-sr/data/settings` into the data-dir before spawn. See [`docs/plan/01-cline-session-id-data-dir.md`](./plan/01-cline-session-id-data-dir.md).
 
 ---
 
@@ -355,7 +358,9 @@ After capture, attach (redacted):
 
 1. `type` histogram  
 2. One sample each of `agent_event`, `hook_event`, `run_result`  
-3. Relevant `--help` lines for json/cwd/timeout/id/system/data-dir  
+3. Relevant `--help` lines for json/cwd/timeout/id/system/data-dir/config  
+4. Confirm sandbox: with `--data-dir`, does provider load from data-dir `settings/providers.json` even if `--config` points at home?  
+5. After a short `--json` run, capture `data/sessions/<id>/<id>.json` (resume id source)
 
 That is enough to implement a Multica `Backend` without guessing schema.
 

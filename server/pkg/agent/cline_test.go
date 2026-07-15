@@ -11,6 +11,30 @@ import (
 	"log/slog"
 )
 
+// init installs a package-local settings fixture so Execute / prepareClinePaths
+// tests do not require a real ~/.cline-sr. Production ignores this override
+// unless tests set clineSettingsSourceDirOverride (this init does).
+func init() {
+	if strings.TrimSpace(clineSettingsSourceDirOverride) != "" {
+		return
+	}
+	dir, err := os.MkdirTemp("", "multica-cline-test-settings-*")
+	if err != nil {
+		panic("cline test settings: " + err.Error())
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		panic(err)
+	}
+	providers := []byte(`{"providers":[{"id":"test","apiKey":"sk-test"}]}`)
+	if err := os.WriteFile(filepath.Join(dir, "providers.json"), providers, 0o600); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "global-settings.json"), []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		panic(err)
+	}
+	clineSettingsSourceDirOverride = dir
+}
+
 func TestNewReturnsClineBackend(t *testing.T) {
 	t.Parallel()
 	b, err := New("cline", Config{ExecutablePath: "/nonexistent/cline"})
@@ -25,10 +49,7 @@ func TestNewReturnsClineBackend(t *testing.T) {
 func TestBuildClineArgsContract(t *testing.T) {
 	t.Parallel()
 	logger := slog.Default()
-	paths := clinePaths{
-		DataDir:   "/tmp/multica-cline-data-test",
-		ConfigDir: "/home/user/.cline-sr/data/settings",
-	}
+	paths := clinePaths{DataDir: "/tmp/multica-cline-data-test"}
 
 	args := buildClineArgs(ExecOptions{
 		Cwd:             "/work",
@@ -55,8 +76,8 @@ func TestBuildClineArgsContract(t *testing.T) {
 	if !containsArgPair(args, "--data-dir", paths.DataDir) {
 		t.Errorf("missing Multica --data-dir in %v", args)
 	}
-	if !containsArgPair(args, "--config", paths.ConfigDir) {
-		t.Errorf("missing Multica --config in %v", args)
+	if containsArg(args, "--config") {
+		t.Errorf("Multica must not pass --config (sandbox seeds settings); got %v", args)
 	}
 	if !containsArgPair(args, "-c", "/work") {
 		t.Errorf("missing -c /work in %v", args)
@@ -109,28 +130,47 @@ func TestBuildClineStdinPayload(t *testing.T) {
 
 func TestBuildClineArgsNoSystemPrompt(t *testing.T) {
 	t.Parallel()
-	args := buildClineArgs(ExecOptions{}, clinePaths{
-		DataDir:   "/tmp/d",
-		ConfigDir: "/tmp/settings",
-	}, slog.Default())
+	args := buildClineArgs(ExecOptions{}, clinePaths{DataDir: "/tmp/d"}, slog.Default())
 	if args[len(args)-1] != clineArgvPromptSentinel {
 		t.Fatalf("prompt sentinel = %q, want %q", args[len(args)-1], clineArgvPromptSentinel)
 	}
 	if !containsArgPair(args, "--data-dir", "/tmp/d") {
 		t.Errorf("expected --data-dir even without optional opts: %v", args)
 	}
-	if !containsArgPair(args, "--config", "/tmp/settings") {
-		t.Errorf("expected --config even without optional opts: %v", args)
+	if containsArg(args, "--config") {
+		t.Errorf("must not pass --config: %v", args)
 	}
 	if containsArg(args, "-c") || containsArg(args, "-m") || containsArg(args, "--id") {
 		t.Errorf("unexpected optional flags: %v", args)
 	}
 }
 
-func TestPrepareClinePathsPinsHomeConfig(t *testing.T) {
-	// Cannot Parallel: t.Setenv mutates process env for this test.
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+// writeClineSettingsFixture creates a settings dir with providers.json (+ optional extra).
+func writeClineSettingsFixture(t *testing.T, dir string, providersBody string, extra map[string]string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	if providersBody == "" {
+		providersBody = `{"providers":[{"id":"openai-compatible","apiKey":"sk-test"}]}`
+	}
+	if err := os.WriteFile(filepath.Join(dir, "providers.json"), []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers.json: %v", err)
+	}
+	for name, body := range extra {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+}
+
+func TestPrepareClinePathsSeedsSettingsIntoDataDir(t *testing.T) {
+	t.Parallel()
+	// Uses package-local fixture from init (clineSettingsSourceDirOverride).
+	src := strings.TrimSpace(clineSettingsSourceDirOverride)
+	if src == "" {
+		t.Fatal("clineSettingsSourceDirOverride not set by package init")
+	}
 
 	paths, err := prepareClinePaths(ExecOptions{})
 	if err != nil {
@@ -139,13 +179,61 @@ func TestPrepareClinePathsPinsHomeConfig(t *testing.T) {
 	if paths.DataDir == "" {
 		t.Fatal("expected isolated data-dir")
 	}
-	wantConfig := filepath.Join(home, ".cline-sr", "data", "settings")
-	if paths.ConfigDir != wantConfig {
-		t.Fatalf("ConfigDir = %q, want %q", paths.ConfigDir, wantConfig)
+	if paths.SettingsSource != src {
+		t.Fatalf("SettingsSource = %q, want %q", paths.SettingsSource, src)
 	}
-	// data-dir must not be nested under the home settings tree
-	if strings.HasPrefix(paths.DataDir, wantConfig) {
-		t.Errorf("data-dir %q must not live under config %q", paths.DataDir, wantConfig)
+	// Seeded into both sandbox layouts.
+	for _, rel := range []string{
+		filepath.Join("settings", "providers.json"),
+		filepath.Join("data", "settings", "providers.json"),
+		filepath.Join("settings", "global-settings.json"),
+		filepath.Join("data", "settings", "global-settings.json"),
+	} {
+		got, err := os.ReadFile(filepath.Join(paths.DataDir, rel))
+		if err != nil {
+			t.Fatalf("seeded file %s: %v", rel, err)
+		}
+		if strings.Contains(rel, "providers") && !strings.Contains(string(got), "sk-test") {
+			t.Errorf("%s content = %q, want seeded providers", rel, got)
+		}
+		if strings.Contains(rel, "global-settings") && !strings.Contains(string(got), "dark") {
+			t.Errorf("%s content = %q, want global-settings seed", rel, got)
+		}
+	}
+	if strings.HasPrefix(paths.DataDir, src) {
+		t.Errorf("data-dir %q must not live under settings source %q", paths.DataDir, src)
+	}
+}
+
+func TestSeedClineSettingsRequiresProvidersJSON(t *testing.T) {
+	t.Parallel()
+	empty := t.TempDir()
+	dataDir := t.TempDir()
+	err := seedClineSettingsIntoDataDir(dataDir, empty)
+	if err == nil {
+		t.Fatal("expected error when providers.json missing")
+	}
+	if !strings.Contains(err.Error(), "providers.json") {
+		t.Fatalf("error = %v, want providers.json mention", err)
+	}
+}
+
+func TestSeedClineSettingsIntoDataDir(t *testing.T) {
+	t.Parallel()
+	src := t.TempDir()
+	writeClineSettingsFixture(t, src, `{"k":1}`, map[string]string{"extra.json": `{"e":true}`})
+	dataDir := t.TempDir()
+	if err := seedClineSettingsIntoDataDir(dataDir, src); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, p := range []string{
+		filepath.Join(dataDir, "settings", "providers.json"),
+		filepath.Join(dataDir, "data", "settings", "providers.json"),
+		filepath.Join(dataDir, "settings", "extra.json"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("missing seeded %s: %v", p, err)
+		}
 	}
 }
 
@@ -234,6 +322,7 @@ func runClineWithStdout(t *testing.T, ndjson string, opts ExecOptions, env map[s
 
 func runClineExecute(t *testing.T, prompt, ndjson string, opts ExecOptions, env map[string]string) clineExecCapture {
 	t.Helper()
+	// Execute → prepareClinePaths seeds settings via package test fixture.
 	tempDir := t.TempDir()
 	fakePath := filepath.Join(tempDir, "cline")
 	writeTestExecutable(t, fakePath, []byte(fakeClineNDJSONScript()))
@@ -457,16 +546,11 @@ func TestClineExecuteSkipsBadLines(t *testing.T) {
 }
 
 func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
-	// Cannot Parallel: t.Setenv mutates process env so --config resolves to a
-	// known home settings path for this test.
+	t.Parallel()
 	ndjson := `{"type":"run_result","finishReason":"completed","text":"ok"}` + "\n"
 	userPrompt := "user prompt with unique task token TASK_SECRET_42"
 	brief := "RUNTIME BRIEF with unique brief token BRIEF_SECRET_99"
 	wantPayload := brief + "\n\n" + userPrompt
-
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	wantConfig := filepath.Join(home, ".cline-sr", "data", "settings")
 
 	cap := runClineExecute(t, userPrompt, ndjson, ExecOptions{
 		Cwd:             t.TempDir(),
@@ -506,15 +590,25 @@ func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
 			t.Errorf("blocked Multica-owned override survived: %v", lines)
 		}
 	}
-	if !containsArgPair(lines, "--config", wantConfig) {
-		t.Errorf("missing Multica --config %q in %v", wantConfig, lines)
+	if containsArg(lines, "--config") {
+		t.Errorf("must not pass --config (settings seeded into data-dir): %v", lines)
 	}
 	if !containsArg(lines, "--data-dir") {
 		t.Errorf("missing Multica --data-dir: %v", lines)
 	}
-	// data-dir must be Multica-owned temp, not user override
-	if dataDir := argValueAfter(lines, "--data-dir"); dataDir == "" || dataDir == "/evil-data" {
+	// data-dir must be Multica-owned temp, not user override; settings must be seeded.
+	dataDir := argValueAfter(lines, "--data-dir")
+	if dataDir == "" || dataDir == "/evil-data" {
 		t.Errorf("data-dir = %q, want isolated temp path", dataDir)
+	} else {
+		seeded := filepath.Join(dataDir, "settings", "providers.json")
+		if _, err := os.Stat(seeded); err != nil {
+			t.Errorf("expected seeded providers at %s: %v", seeded, err)
+		}
+		seededNested := filepath.Join(dataDir, "data", "settings", "providers.json")
+		if _, err := os.Stat(seededNested); err != nil {
+			t.Errorf("expected nested seeded providers at %s: %v", seededNested, err)
+		}
 	}
 	if !containsArgPair(lines, "-m", "model-x") {
 		t.Errorf("missing -m: %v", lines)

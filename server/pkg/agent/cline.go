@@ -25,8 +25,10 @@ const clineArgvPromptSentinel = "\n"
 // control plane (形态 B). Users must not override protocol transport, cwd,
 // session isolation/resume, system/timeout flags (v1 never passes -s/-t),
 // or model. Multica owns --data-dir for per-run isolation + disk SessionID
-// discovery, and --config so auth/settings stay on the user's CLI home
-// settings tree even when data-dir is isolated (see plan 01).
+// discovery (see plan 01). --config is blocked but not passed: --data-dir
+// enables CLI sandbox mode which forces provider settings under data-dir
+// (CLINE_PROVIDER_SETTINGS_PATH), so Multica seeds ~/.cline-sr settings into
+// the isolated tree instead of relying on --config.
 //
 // --auto-approve is not passed on argv (CLI default is true for headless
 // tool approval) but stays blocked so CustomArgs cannot force false and hang
@@ -82,7 +84,7 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		"argv_prompt", "newline_sentinel",
 		"stdin_bytes", len(payload),
 		"data_dir", paths.DataDir,
-		"config_dir", paths.ConfigDir,
+		"settings_source", paths.SettingsSource,
 	)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
@@ -118,7 +120,7 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		"model", opts.Model,
 		"stdin_bytes", len(payload),
 		"data_dir", paths.DataDir,
-		"config_dir", paths.ConfigDir,
+		"settings_source", paths.SettingsSource,
 	)
 
 	// Deliver full Multica payload on stdin and close for EOF. Concurrent with
@@ -255,30 +257,36 @@ func buildClineStdinPayload(prompt string, opts ExecOptions) string {
 // clinePaths holds Multica-owned filesystem locations for one Cline run.
 type clinePaths struct {
 	// DataDir is the isolated --data-dir root (sessions live under data/sessions).
+	// Provider auth is seeded into this tree before spawn (sandbox mode).
 	DataDir string
-	// ConfigDir is the authenticated settings tree passed as --config
-	// (default: ~/.cline-sr/data/settings for the Multica-targeted CLI home).
-	// Must be set explicitly: a fresh --data-dir has empty data/settings, so
-	// omitting --config forces the CLI to re-validate token/model interactively.
-	ConfigDir string
+	// SettingsSource is the user CLI settings directory copied into DataDir
+	// (default: ~/.cline-sr/data/settings). Not passed as --config.
+	SettingsSource string
 }
 
-// defaultClineConfigDir returns the Multica Cline CLI home settings path
-// (~/.cline-sr/data/settings) under the current user's home directory.
-func defaultClineConfigDir() (string, error) {
+// clineSettingsSourceDirOverride is set only by tests to a fixture settings
+// directory. Production always uses ~/.cline-sr/data/settings.
+var clineSettingsSourceDirOverride string
+
+// defaultClineSettingsSourceDir returns the Multica Cline CLI home settings
+// path (~/.cline-sr/data/settings) used as the seed source for sandbox runs.
+func defaultClineSettingsSourceDir() (string, error) {
+	if v := strings.TrimSpace(clineSettingsSourceDirOverride); v != "" {
+		return v, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("cline: resolve home for --config: %w", err)
+		return "", fmt.Errorf("cline: resolve home for settings seed: %w", err)
 	}
 	if strings.TrimSpace(home) == "" {
-		return "", fmt.Errorf("cline: empty home directory for --config")
+		return "", fmt.Errorf("cline: empty home directory for settings seed")
 	}
 	return filepath.Join(home, ".cline-sr", "data", "settings"), nil
 }
 
 // prepareClinePaths chooses an isolated data-dir under the process temp base
-// (daemon sets TMPDIR per task) and pins --config to the user's CLI settings
-// so provider auth/model survive data-dir isolation.
+// (daemon sets TMPDIR per task) and seeds provider settings into it so sandbox
+// mode still has auth/model without --config.
 func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
 	// os.MkdirTemp honors TMPDIR; the daemon sets a per-task TMPDIR so this
 	// stays outside the user's project worktree (local_directory mode).
@@ -287,11 +295,102 @@ func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
 	if err != nil {
 		return clinePaths{}, fmt.Errorf("cline: create data-dir: %w", err)
 	}
-	configDir, err := defaultClineConfigDir()
+	src, err := defaultClineSettingsSourceDir()
 	if err != nil {
 		return clinePaths{}, err
 	}
-	return clinePaths{DataDir: dataDir, ConfigDir: configDir}, nil
+	if err := seedClineSettingsIntoDataDir(dataDir, src); err != nil {
+		return clinePaths{}, err
+	}
+	return clinePaths{DataDir: dataDir, SettingsSource: src}, nil
+}
+
+// seedClineSettingsIntoDataDir copies authenticated CLI settings into the
+// isolated data-dir. --data-dir enables Cline sandbox mode, which forces
+// CLINE_PROVIDER_SETTINGS_PATH under the data-dir and ignores a separate
+// --config for provider auth. We seed both common layouts:
+//   - <data-dir>/settings          (OSS sandbox env path)
+//   - <data-dir>/data/settings     (nested tree when data-dir is ~/.cline root)
+// providers.json is required; other files are copied when present.
+func seedClineSettingsIntoDataDir(dataDir, srcSettings string) error {
+	srcSettings = strings.TrimSpace(srcSettings)
+	if srcSettings == "" {
+		return fmt.Errorf("cline: empty settings source for seed")
+	}
+	providers := filepath.Join(srcSettings, "providers.json")
+	st, err := os.Stat(providers)
+	if err != nil {
+		return fmt.Errorf("cline: missing providers.json under %s (run cline auth first): %w", srcSettings, err)
+	}
+	if st.IsDir() {
+		return fmt.Errorf("cline: providers.json under %s is a directory", srcSettings)
+	}
+
+	dests := []string{
+		filepath.Join(dataDir, "settings"),
+		filepath.Join(dataDir, "data", "settings"),
+	}
+	for _, dest := range dests {
+		if err := copyClineSettingsDir(srcSettings, dest); err != nil {
+			return fmt.Errorf("cline: seed settings into %s: %w", dest, err)
+		}
+	}
+	return nil
+}
+
+// copyClineSettingsDir recursively copies settings files from src to dst.
+// Files are written with 0o600 (may contain API keys). Directories 0o700.
+func copyClineSettingsDir(src, dst string) error {
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		// Skip non-regular files (symlinks to secrets are still opened via Open).
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		return copyClineFile(path, target, 0o600)
+	})
+}
+
+func copyClineFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 // buildClineArgs assembles argv for a headless Cline 3.x NDJSON run.
@@ -299,15 +398,12 @@ func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
 // payload is written to stdin (see buildClineStdinPayload). No -s.
 // Timeout is owned by Multica runContext; -t is never passed (v1).
 // paths.DataDir is always passed as --data-dir for isolation + session discovery.
-// paths.ConfigDir is always passed as --config so isolated data-dir does not
-// drop provider auth/settings. --auto-approve is omitted (CLI default true).
+// --config is never passed (sandbox ignores it for providers; settings are seeded).
+// --auto-approve is omitted (CLI default true).
 func buildClineArgs(opts ExecOptions, paths clinePaths, logger *slog.Logger) []string {
 	args := []string{"--json"}
 	if paths.DataDir != "" {
 		args = append(args, "--data-dir", paths.DataDir)
-	}
-	if paths.ConfigDir != "" {
-		args = append(args, "--config", paths.ConfigDir)
 	}
 	if opts.Cwd != "" {
 		args = append(args, "-c", opts.Cwd)

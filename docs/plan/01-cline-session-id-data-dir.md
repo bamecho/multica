@@ -1,11 +1,19 @@
 # 01 — Cline Session ID via Data-Dir Discovery
 
-**Status:** Implemented (2026-07-15) — P0: isolated `--data-dir` + post-exit disk discovery for `Result.SessionID`, paired with explicit `--config ~/.cline-sr/data/settings` so auth/model survive isolation. P1 (persist data-dir / verified `--id` resume) not done.  
+**Status:** Implemented (2026-07-15) — P0 complete:
+
+- Isolated `--data-dir` + post-exit disk discovery for `Result.SessionID`
+- Auth via **seed** of `~/.cline-sr/data/settings` into the data-dir (sandbox ignores `--config` for providers)
+- No `--config` on Multica argv
+
+P1 (persist data-dir / verified `--id` resume) not done.
+
 **Scope:** Obtain a resume-capable `sessionId` for Multica’s `cline` NDJSON backend  
 **Related:**
 
 - [`docs/cline-ndjson-multica-adapter-plan.md`](../cline-ndjson-multica-adapter-plan.md) — overall adapter design
 - [`docs/cline-ndjson-probe.md`](../cline-ndjson-probe.md) — probe cookbook
+- [`docs/plan/02-cline-prompt-stdin-hybrid.md`](./02-cline-prompt-stdin-hybrid.md) — long prompt via stdin
 - Backend: `server/pkg/agent/cline.go`
 - Daemon session plumbing: `server/internal/daemon/daemon.go` (`PriorSessionID` → `ExecOptions.ResumeSessionID` → `Result.SessionID`)
 
@@ -13,7 +21,7 @@
 
 ## 1. Problem
 
-After a real Cline 3.0.40 `--json` run, Multica’s `Result.SessionID` is always empty.
+After a real Cline 3.0.40 `--json` run, Multica’s `Result.SessionID` is always empty if it only trusts NDJSON.
 
 ### Evidence (local probe, 2026-07-15)
 
@@ -25,7 +33,7 @@ After a real Cline 3.0.40 `--json` run, Multica’s `Result.SessionID` is always
 | `cline history --json` | `"sessionId": "<id>"` matching disk |
 | Resume flag | `--id <session-id>` (official CLI reference) |
 
-Unit fixtures in `cline_test.go` inject synthetic `"sessionId":"ses_…"` lines that **real CLI never emits**, so tests green-washed the gap.
+Unit fixtures that inject synthetic `"sessionId":"ses_…"` lines **green-wash** the gap: real CLI never emits those fields.
 
 Official docs ([CLI reference](https://docs.cline.bot/cli/cli-reference), [SDK events](https://docs.cline.bot/sdk/events)) confirm:
 
@@ -46,10 +54,11 @@ Official docs ([CLI reference](https://docs.cline.bot/cli/cli-reference), [SDK e
    ```
 
 3. Do **not** treat `taskId` / `agentId` as `SessionID` (wrong type; resume would fail).
+4. Keep headless auth working under isolated `--data-dir` (no interactive token/model prompts).
 
 ---
 
-## 3. Chosen solution: per-task `--data-dir` + post-exit disk discovery
+## 3. Chosen solution: per-task `--data-dir` + seed settings + post-exit disk discovery
 
 ### 3.1 Why this path
 
@@ -61,7 +70,7 @@ Official docs ([CLI reference](https://docs.cline.bot/cli/cli-reference), [SDK e
 | Embed Cline SDK | **Out of scope** — daemon spawns CLI |
 | Multica invents a random `--id` every run | **Unverified** — CLI may require a previously created session |
 
-**Primary:** isolate Cline local state with `--data-dir`, then after `cmd.Wait()` read `session_id` from that tree.
+**Primary:** isolate Cline local state with `--data-dir`, seed auth into that tree, then after `cmd.Wait()` read `session_id` from disk.
 
 Same *family* of solutions as:
 
@@ -71,19 +80,21 @@ Same *family* of solutions as:
 
 Unlike **claude / cursor / copilot / opencode**, Cline does not put a resume id in the stream.
 
-### 3.2 `data-dir` vs `config` (Cline CLI)
+### 3.2 `data-dir` vs `config` vs sandbox (Cline CLI)
 
-| Flag | Default (3.0.40 help) | Contents | Role |
+| Flag / concept | Default (OSS 3.x) | Contents | Role |
 | --- | --- | --- | --- |
-| `--config <path>` | `~/.cline/data/settings` | Provider, model, API keys, settings | **Who / how to call the model** |
+| `--config <path>` | `~/.cline/data/settings` | Provider, model, API keys, settings | **Who / how to call the model** when **not** in sandbox |
 | `--data-dir <path>` | `~/.cline` | Sessions, db, cache, logs (under `data/`) | **Where this run’s state lives** |
+| Sandbox (implicit) | off | — | **Enabled automatically when `--data-dir` is set** (OSS + Multica fork) |
 
-Default layout:
+Default global layout (no Multica isolation):
 
 ```text
-~/.cline/                          ← --data-dir
+~/.cline/                          ← default --data-dir (OSS)
 ├── data/
-│   ├── settings/                  ← --config default
+│   ├── settings/                  ← default --config
+│   │   └── providers.json
 │   ├── sessions/<session_id>/
 │   │   ├── <session_id>.json      ← "session_id", pid, cwd, prompt, …
 │   │   └── <session_id>.messages.json
@@ -93,105 +104,128 @@ Default layout:
 └── …
 ```
 
-Implications:
+Multica-targeted CLI home (settings **source** for seed):
 
-- Session discovery reads **data-dir**, not config.
-- A fresh `--data-dir` can also get an empty `data/settings` (probe: only default `cline` provider). Auth must stay reachable via:
-  - **A (preferred):** pair `--data-dir <isolated>` with `--config <daemon-or-user settings>`, if the CLI honors both independently, or
-  - **B:** seed provider settings into the isolated data-dir before spawn, or
-  - **C (fallback only):** use global data-dir and match by `pid` / cwd / time window (concurrency-weak).
-
-`cline history` exposes `--config` but **not** `--data-dir`; prefer **filesystem scan** of `sessions/` over history subprocess.
-
-### 3.3 Launch contract (delta to current adapter)
-
-Current argv (v1 adapter):
-
-```bash
-cline --json --auto-approve true \
-  -c <workdir> \
-  [-m <model>] \
-  [--id <prior>] \
-  "<SystemPrompt>\n\n<userPrompt>"
+```text
+~/.cline-sr/data/settings/
+  providers.json                   ← required for headless runs
+  global-settings.json             ← optional; copied if present
+  …
 ```
 
-Proposed:
+**Sandbox behavior (open-source `configureSandboxEnvironment`):**
 
-```bash
-cline --json --auto-approve true \
-  --data-dir <clineDataDir> \
-  [--config <clineConfigDir>] \
-  -c <workdir> \
-  [-m <model>] \
-  [-P <provider>] \
-  [--id <prior>] \
-  "<combined prompt>"
-```
+When `--data-dir` is set, CLI sets (among others):
 
-| Path | Recommendation |
+| Env | Value |
 | --- | --- |
-| `clineDataDir` | Per task under daemon temp / cache, **not** inside a user’s git worktree for `local_directory` mode. Example: `$TASK_TMPDIR/cline-data` or daemon cache keyed by `(agent, issue)` when resume must survive. |
-| `clineConfigDir` | Existing authenticated settings (user or daemon-managed), unless seeding into data-dir. |
+| `CLINE_SANDBOX` | `1` |
+| `CLINE_DATA_DIR` | `<data-dir>` |
+| `CLINE_SESSION_DATA_DIR` | `<data-dir>/sessions` |
+| **`CLINE_PROVIDER_SETTINGS_PATH`** | **`<data-dir>/settings/providers.json`** |
 
-Filter `CustomArgs` so users cannot override `--data-dir` / `--config` / `--id` in ways that break isolation or resume.
+So a separate **`--config` does not restore provider auth** under sandbox. Passing only `--config ~/.cline-sr/data/settings` still leaves empty providers inside the data-dir and can force interactive token/model validation.
+
+Auth options:
+
+| Option | Verdict |
+| --- | --- |
+| **A** — `--data-dir` + `--config` only | **Not viable** under sandbox for providers |
+| **B** — seed home settings into data-dir before spawn | **Chosen (P0 implemented)** |
+| **C** — global data-dir + pid/time match | **Fallback only** — concurrency-weak |
+
+`cline history` exposes `--config` but **not** `--data-dir`; Multica prefers **filesystem scan** of `sessions/` over a history subprocess.
+
+### 3.3 Launch contract (implemented)
+
+```bash
+# Multica-owned prep (not argv):
+#   dataDir = $TMPDIR/multica-cline-data-*
+#   seed ~/.cline-sr/data/settings → 
+#     <dataDir>/settings/
+#     <dataDir>/data/settings/
+#   (providers.json required; other files copied when present)
+
+cli --json \
+  --data-dir <clineDataDir> \
+  -c <workdir> \
+  [-m <model>] \
+  [--id <prior>] \
+  $'\n'                    # argv prompt gate only (plan 02)
+
+# stdin: SystemPrompt + "\n\n" + userPrompt
+```
+
+| Item | Multica behavior |
+| --- | --- |
+| `clineDataDir` | Per-run `os.MkdirTemp` under daemon `TMPDIR` (outside user git worktree) |
+| Settings source | `~/.cline-sr/data/settings` |
+| Seed destinations | `<dataDir>/settings` **and** `<dataDir>/data/settings` (OSS sandbox path + nested layout) |
+| `--config` | **Not passed**; blocked in `CustomArgs` |
+| `--auto-approve` | **Not passed** (CLI default true for headless); still blocked in `CustomArgs` |
+| Session discovery | After `Wait`, scan data-dir session JSON → `Result.SessionID` |
+
+Filter `CustomArgs` so users cannot override `--data-dir`, `--config`, `--id`, `-c`, `-m`, protocol flags, etc.
 
 ### 3.4 Discovery algorithm (after `cmd.Wait()`)
 
 ```text
 1. List <clineDataDir>/data/sessions/*/*.json
-   (exact nesting may be <data-dir>/data/sessions or <data-dir>/sessions —
-    implement against real layout; default tree uses data/sessions under ~/.cline)
+   and <clineDataDir>/sessions/*/*.json
 
 2. Score each session JSON:
    - pid == child Process.Pid          (strongest)
    - cwd / workspace_root == opts.Cwd
    - started_at ∈ [startTime, endTime]
-   - prompt prefix matches combined prompt
-     (Cline may wrap with <user_input mode="act">…; match flexibly)
+   - prompt matches Multica stdin payload (Cline may wrap <user_input>…)
 
 3. Pick unique best match → session_id
+   Single candidate under isolated data-dir is accepted even if hints are weak.
 
 4. Result.SessionID = session_id
    If no match: leave empty + log warn (daemon keeps current no-resume behavior)
+
+5. Never accept conv_* / agent_* as resume ids.
 ```
 
-Session JSON fields already observed:
-
-`session_id`, `pid`, `cwd`, `workspace_root`, `prompt`, `started_at`, `ended_at`, `status`, `exit_code`, `provider`, `model`.
+Session JSON fields used: `session_id`, `pid`, `cwd`, `workspace_root`, `prompt`, `started_at`, `ended_at`, `status`.
 
 ### 3.5 Resume
 
-- When `opts.ResumeSessionID != ""`, pass `--id` and **reuse the same `clineDataDir`** that still holds that session.
+- When `opts.ResumeSessionID != ""`, pass `--id`.
+- **P1:** reuse the same durable `clineDataDir` that still holds that session; seed only on first create.
 - Align with existing `gateResumeToReusedWorkdir`: if workdir/state is gone, clear prior session.
 - **P1 verification required:** local probes saw `--json --id …` fail with  
   `JSON output mode requires a prompt argument or piped stdin`  
-  even when a prompt was passed. Treat resume argv/ordering as a separate hardening task; **P0 may only record SessionID**.
+  even when a prompt was passed. Treat resume argv/ordering as a separate hardening task; **P0 only records SessionID**.
 
 ### 3.6 Explicit non-goals (this plan)
 
 - Mapping full tool timeline from real `hookEventName` / `contentType=tool` (separate plan)
-- Fixing “command is too long” argv limits (separate plan)
+- Long-prompt delivery (plan 02 — implemented)
 - Changing Multica’s generic task session DB schema
 
 ---
 
-## 4. Implementation sketch
+## 4. Implementation (code map)
 
-| Area | Change |
+| Area | Implementation |
 | --- | --- |
-| `server/pkg/agent/cline.go` | Choose/pass `--data-dir` (+ optional `--config`); after Wait, `discoverClineSessionID(dataDir, matchHints)`; set `Result.SessionID` |
-| `ExecOptions` or backend-local path | Prefer backend-owned path under env `TMPDIR` / opts already passed by daemon; avoid new daemon special-cases if possible |
-| Blocked args | Add `--data-dir`, `--config` to `clineBlockedArgs` if Multica owns them |
-| Tests | Fake CLI that writes a real-shaped session JSON under a temp data-dir; assert `Result.SessionID`. Replace synthetic NDJSON `sessionId` fixtures as “not real CLI contract” |
-| Docs | Update adapter plan § session + this file’s Status when implemented |
+| `prepareClinePaths` | `MkdirTemp` + `seedClineSettingsIntoDataDir` |
+| `defaultClineSettingsSourceDir` | `~/.cline-sr/data/settings` |
+| `seedClineSettingsIntoDataDir` | Require `providers.json`; shallow-copy tree to both dest layouts; files `0o600` |
+| `buildClineArgs` | `--json --data-dir …` only; **no** `--config` / `--auto-approve` |
+| `discoverClineSessionID` | Post-exit disk scan; ignore NDJSON `sessionId` |
+| Blocked args | `--data-dir`, `--config`, `--id`, `-c`, `-m`, `--json`, … |
+| Tests | `cline_test.go`: seed layouts, missing providers, SessionID from disk, no `--config` on argv |
 
 ### Phasing
 
-| Phase | Deliverable |
-| --- | --- |
-| **P0** | Isolated data-dir + disk discovery → non-empty `Result.SessionID` on success/failure when session files exist |
-| **P1** | Persist data-dir lifecycle with workdir reuse; verify `--id` resume under `--json` |
-| **P2** | Real hook/tool schema + long-prompt delivery (out of this doc’s implementation, track separately) |
+| Phase | Deliverable | Status |
+| --- | --- | --- |
+| **P0** | Isolated data-dir + seed + disk discovery → non-empty `Result.SessionID` when session files exist | **Done** |
+| **P1** | Persist data-dir lifecycle with workdir reuse; verify `--id` resume under `--json` | Not done |
+| **P2** | Real hook/tool schema hardening (track separately) | Not this plan |
 
 ---
 
@@ -199,21 +233,23 @@ Session JSON fields already observed:
 
 | Risk | Mitigation |
 | --- | --- |
-| Isolated data-dir drops auth | Always pair with working `--config` or seed settings |
-| Concurrent runs share global `~/.cline` | Default to per-task data-dir |
-| Session file layout changes across Cline versions | Match on fields + pid; log path used; keep probe fixtures |
-| Resume + `--json` broken on some versions | P0 record id only; P1 gate resume behind verified CLI version |
+| Isolated data-dir drops auth | **Seed** `providers.json` (+ other settings) into data-dir; fail closed if missing |
+| `--config` assumed to fix sandbox | Documented non-viable; Multica never relies on it for providers |
+| Concurrent runs share global home | Default to per-task data-dir; seed is a **copy**, not symlink |
+| Session file layout changes | Match on fields + pid; accept both `data/sessions` and `sessions` |
+| Resume + `--json` broken on some versions | P0 record id only; P1 gate resume behind verified CLI |
 | Local mode pollutes user repo | Never put data-dir under user project root; use task temp / daemon cache |
-| `taskId` mistaken for session | Code comments + tests that reject `conv_` / `agent_` prefixes for `--id` |
+| `taskId` mistaken for session | Code + tests reject `conv_` / `agent_` prefixes for `--id` |
 
 ---
 
-## 6. Verification plan
+## 6. Verification
 
-1. **Unit:** fake binary writes `sessions/<id>/<id>.json` with known pid/cwd → `Result.SessionID == id`.
-2. **Integration (optional, real CLI):** `MULTICA_CLINE_PATH=cline` short `--json` run with temp data-dir + openai-compatible provider → assert id on disk equals Multica result (manual or opt-in test).
-3. **Negative:** NDJSON without disk session → empty SessionID, no panic.
-4. **Regression:** existing NDJSON text/usage/`run_result` mapping still passes.
+1. **Unit:** fake binary writes `data/sessions/<id>/<id>.json` → `Result.SessionID == id`.
+2. **Unit:** seed places `providers.json` under both settings layouts; missing source fails with clear error.
+3. **Unit:** argv has `--data-dir`, no `--config`; stdin holds Multica payload (plan 02).
+4. **Ops prerequisite:** machine has authenticated `~/.cline-sr/data/settings/providers.json`.
+5. **Negative:** NDJSON without disk session → empty SessionID, no panic.
 
 ---
 
@@ -226,13 +262,16 @@ Session JSON fields already observed:
 | 2026-07-15 | Do not store `taskId`/`agentId` as Multica `SessionID` |
 | 2026-07-15 | Config vs data-dir are distinct; session lives under data-dir |
 | 2026-07-15 | P0 = record SessionID; P1 = prove resume |
+| 2026-07-15 | **`--data-dir` enables sandbox; `--config` does not supply providers** (OSS + fork) |
+| 2026-07-15 | **Auth path = seed `~/.cline-sr/data/settings` into data-dir; Multica does not pass `--config`** |
+| 2026-07-15 | Dual seed destinations: `<data-dir>/settings` and `<data-dir>/data/settings` |
 
 ---
 
-## 8. Open questions
+## 8. Open questions (P1)
 
 1. Should per-agent long-lived data-dir (better resume) or per-task data-dir (better isolation) be the default when workdir is reused?
-2. Does the target internal CLI fork honor `--data-dir` / `--config` the same as open-source 3.0.40?
-3. Can Multica pre-create a session id, or must the first run always be id-less?
+2. Can Multica pre-create a session id, or must the first run always be id-less?
+3. Exact resume argv + stdin ordering on the production internal CLI fork.
 
 Resolve against the **actual** binary used in production before locking P1.

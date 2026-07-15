@@ -87,14 +87,17 @@ Documented human pattern (`git diff | cline "review these changes"`) still works
 ### 3.3 Chosen delivery: **newline sentinel argv + full payload on stdin**
 
 ```text
-argv:  cline --json --auto-approve true
-         [--data-dir …] [--config …]
+argv:  cline --json
+         --data-dir <isolated>          # Multica-owned; seeds settings (plan 01)
          -c <workdir>
-         [-m model] [-P provider] [--id prior]
+         [-m model] [--id prior]
          $'\n'                          # single newline — gate only; no semantic content
 
 stdin: SystemPrompt + "\n\n" + userPrompt   # full Multica payload
          EOF after write
+
+# Not on argv: --config (sandbox ignores it for providers; settings are seeded),
+#              --auto-approve (CLI default true; still blocked in CustomArgs)
 ```
 
 | Channel | Content |
@@ -184,17 +187,18 @@ Do **not** invent `@file` prompt flags without verification on the target CLI.
 
 Stdout NDJSON scanning continues as today. Stdin write is one-shot; brief size is typically tens–hundreds of KB — fine in one write after `Start`.
 
-### Interaction with plan 01 (`--data-dir`)
+### Interaction with plan 01 (`--data-dir` + settings seed)
 
-Orthogonal and complementary:
+Orthogonal and complementary (both implemented):
 
 ```text
-argv: short flags + "\n" + optional --data-dir/--id
+prep:  seed ~/.cline-sr/data/settings → <data-dir>/settings (+ data/settings)
+argv:  --json --data-dir <isolated> -c … [-m …] [--id …] "\n"
 stdin: full Multica payload
-disk:  session_id discovery after Wait
+disk:  session_id discovery after Wait (under data-dir)
 ```
 
-Implement in either order; together they cover **start** (length / semantics) and **finish** (session id).
+Together they cover **start** (length / semantics + auth under sandbox) and **finish** (session id).
 
 ---
 
@@ -261,6 +265,7 @@ Implement in either order; together they cover **start** (length / semantics) an
 | 2026-07-15 | Hybrid (task argv + brief stdin) kept as fallback if whitespace gate is tightened |
 | 2026-07-15 | Windows CreateProcess limit remains a primary production motivator |
 | 2026-07-15 | Orthogonal to session data-dir plan (01) |
+| 2026-07-15 | Plan 01 auth is settings **seed**, not `--config` on argv |
 
 ---
 
