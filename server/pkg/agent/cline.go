@@ -7,20 +7,37 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
+// clineArgvPromptSentinel is the positional prompt passed on argv for headless
+// --json runs. Cline 3.x gates on truthiness of o.prompt (empty string fails);
+// a single newline passes the gate and is trimmed out of the session user
+// message so the model only sees the full Multica payload on stdin.
+// See docs/plan/02-cline-prompt-stdin-hybrid.md.
+const clineArgvPromptSentinel = "\n"
+
 // clineBlockedArgs are flags owned by the daemon for the Cline 3.x NDJSON
 // control plane (形态 B). Users must not override protocol transport, cwd,
-// session resume, system/timeout flags (v1 never passes -s/-t), or model.
+// session isolation/resume, system/timeout flags (v1 never passes -s/-t),
+// or model. Multica owns --data-dir for per-run isolation + disk SessionID
+// discovery (see plan 01).
+//
+// --auto-approve is not passed on argv (CLI default is true for headless
+// tool approval) but stays blocked so CustomArgs cannot force false and hang
+// a daemon run on interactive approval. --config is also omitted so the CLI
+// uses its home default settings.
 var clineBlockedArgs = map[string]blockedArgMode{
 	"--json":         blockedStandalone,
 	"--auto-approve": blockedWithValue,
 	"-c":             blockedWithValue,
 	"--cwd":          blockedWithValue,
 	"--id":           blockedWithValue,
+	"--data-dir":     blockedWithValue,
 	"-s":             blockedWithValue,
 	"--system":       blockedWithValue,
 	"-t":             blockedWithValue,
@@ -30,9 +47,8 @@ var clineBlockedArgs = map[string]blockedArgMode{
 }
 
 // clineBackend implements Backend by spawning a Cline-compatible CLI with
-// `--json --auto-approve true` and parsing Cline 3.x NDJSON (形态 B) from
-// stdout: agent_event / hook_event / run_result. See
-// docs/cline-ndjson-multica-adapter-plan.md.
+// `--json` and parsing Cline 3.x NDJSON (形态 B) from stdout: agent_event /
+// hook_event / run_result. See docs/cline-ndjson-multica-adapter-plan.md.
 type clineBackend struct {
 	cfg Config
 }
@@ -49,10 +65,23 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	timeout := opts.Timeout
 	runCtx, cancel := runContext(ctx, timeout)
 
-	args := buildClineArgs(prompt, opts, b.cfg.Logger)
+	payload := buildClineStdinPayload(prompt, opts)
+	paths, pathErr := prepareClinePaths(opts)
+	if pathErr != nil {
+		cancel()
+		return nil, pathErr
+	}
+	args := buildClineArgs(opts, paths, b.cfg.Logger)
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	// Never log full stdin body at info — only size + argv sentinel label.
+	b.cfg.Logger.Info("agent command",
+		"exec", execPath,
+		"args", args,
+		"argv_prompt", "newline_sentinel",
+		"stdin_bytes", len(payload),
+		"data_dir", paths.DataDir,
+	)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -64,6 +93,11 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		cancel()
 		return nil, fmt.Errorf("cline stdout pipe: %w", err)
 	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("cline stdin pipe: %w", err)
+	}
 	stderrTail := newStderrTail(newLogWriter(b.cfg.Logger, "[cline:stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrTail
 
@@ -72,7 +106,31 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		return nil, fmt.Errorf("start cline: %w", err)
 	}
 
-	b.cfg.Logger.Info("cline started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	childPID := 0
+	if cmd.Process != nil {
+		childPID = cmd.Process.Pid
+	}
+	b.cfg.Logger.Info("cline started",
+		"pid", childPID,
+		"cwd", opts.Cwd,
+		"model", opts.Model,
+		"stdin_bytes", len(payload),
+		"data_dir", paths.DataDir,
+	)
+
+	// Deliver full Multica payload on stdin and close for EOF. Concurrent with
+	// stdout drain so a large write cannot deadlock against a chatty child.
+	go func() {
+		defer func() { _ = stdin.Close() }()
+		if payload == "" {
+			return
+		}
+		if _, werr := io.WriteString(stdin, payload); werr != nil {
+			if b.cfg.Logger != nil {
+				b.cfg.Logger.Debug("cline: stdin write failed", "error", werr)
+			}
+		}
+	}()
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -91,7 +149,8 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		scanResult := b.processEvents(stdout, msgCh)
 
 		exitErr := cmd.Wait()
-		duration := time.Since(startTime)
+		endTime := time.Now()
+		duration := endTime.Sub(startTime)
 		stderr := stderrTail.Tail()
 
 		// Wall-clock context owns timeout in v1 (CLI -t is never passed).
@@ -138,7 +197,24 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			}
 		}
 
-		b.cfg.Logger.Info("cline finished", "pid", cmd.Process.Pid, "status", scanResult.status, "duration", duration.Round(time.Millisecond).String())
+		// Resume-capable session id lives on disk under --data-dir, not in
+		// real CLI NDJSON. Never treat stream sessionId / taskId / agentId as
+		// Result.SessionID (see docs/plan/01-cline-session-id-data-dir.md).
+		sessionID := discoverClineSessionID(paths.DataDir, clineSessionMatchHints{
+			PID:       childPID,
+			Cwd:       opts.Cwd,
+			Prompt:    payload,
+			StartTime: startTime,
+			EndTime:   endTime,
+		}, b.cfg.Logger)
+
+		b.cfg.Logger.Info("cline finished",
+			"pid", childPID,
+			"status", scanResult.status,
+			"duration", duration.Round(time.Millisecond).String(),
+			"session_id", sessionID,
+			"data_dir", paths.DataDir,
+		)
 
 		var usage map[string]TokenUsage
 		u := scanResult.usage
@@ -155,7 +231,7 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			Output:     scanResult.output,
 			Error:      scanResult.errMsg,
 			DurationMs: duration.Milliseconds(),
-			SessionID:  scanResult.sessionID,
+			SessionID:  sessionID,
 			Usage:      usage,
 		}
 	}()
@@ -163,11 +239,47 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
+// buildClineStdinPayload builds the full Multica prompt delivered on process
+// stdin (runtime brief + user task). Empty system prompt is skipped; user
+// prompt is used as-is so empty-task edge cases stay explicit.
+func buildClineStdinPayload(prompt string, opts ExecOptions) string {
+	if strings.TrimSpace(opts.SystemPrompt) != "" {
+		return opts.SystemPrompt + "\n\n" + prompt
+	}
+	return prompt
+}
+
+// clinePaths holds Multica-owned filesystem locations for one Cline run.
+type clinePaths struct {
+	// DataDir is the isolated --data-dir root (sessions live under data/sessions).
+	DataDir string
+}
+
+// prepareClinePaths chooses an isolated data-dir under the process temp base
+// (daemon sets TMPDIR per task). Auth/settings are left to the CLI default
+// --config (home); Multica does not pass --config.
+func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
+	// os.MkdirTemp honors TMPDIR; the daemon sets a per-task TMPDIR so this
+	// stays outside the user's project worktree (local_directory mode).
+	// P1 may reuse a durable data-dir when ResumeSessionID is set.
+	dataDir, err := os.MkdirTemp("", "multica-cline-data-*")
+	if err != nil {
+		return clinePaths{}, fmt.Errorf("cline: create data-dir: %w", err)
+	}
+	return clinePaths{DataDir: dataDir}, nil
+}
+
 // buildClineArgs assembles argv for a headless Cline 3.x NDJSON run.
-// System/runtime brief is prepended into the final prompt arg (no -s).
+// The positional prompt is only the newline gate sentinel; the real Multica
+// payload is written to stdin (see buildClineStdinPayload). No -s.
 // Timeout is owned by Multica runContext; -t is never passed (v1).
-func buildClineArgs(prompt string, opts ExecOptions, logger *slog.Logger) []string {
-	args := []string{"--json", "--auto-approve", "true"}
+// paths.DataDir is always passed as --data-dir for isolation + session discovery.
+// --auto-approve and --config are omitted (CLI defaults: approve tools; home settings).
+func buildClineArgs(opts ExecOptions, paths clinePaths, logger *slog.Logger) []string {
+	args := []string{"--json"}
+	if paths.DataDir != "" {
+		args = append(args, "--data-dir", paths.DataDir)
+	}
 	if opts.Cwd != "" {
 		args = append(args, "-c", opts.Cwd)
 	}
@@ -178,13 +290,269 @@ func buildClineArgs(prompt string, opts ExecOptions, logger *slog.Logger) []stri
 		args = append(args, "--id", opts.ResumeSessionID)
 	}
 	args = append(args, filterCustomArgs(opts.CustomArgs, clineBlockedArgs, logger)...)
-
-	combined := prompt
-	if strings.TrimSpace(opts.SystemPrompt) != "" {
-		combined = opts.SystemPrompt + "\n\n" + prompt
-	}
-	args = append(args, combined)
+	args = append(args, clineArgvPromptSentinel)
 	return args
+}
+
+// clineSessionMatchHints scores session JSON files under a data-dir after exit.
+type clineSessionMatchHints struct {
+	PID       int
+	Cwd       string
+	Prompt    string // Multica stdin payload (may be wrapped by Cline on disk)
+	StartTime time.Time
+	EndTime   time.Time
+}
+
+// clineSessionFile is the subset of Cline disk session JSON used for discovery.
+// Real CLI (3.0.40) writes data/sessions/<id>/<id>.json with these fields.
+type clineSessionFile struct {
+	SessionID     string `json:"session_id"`
+	PID           int    `json:"pid"`
+	Cwd           string `json:"cwd"`
+	WorkspaceRoot string `json:"workspace_root"`
+	Prompt        string `json:"prompt"`
+	StartedAt     string `json:"started_at"`
+	EndedAt       string `json:"ended_at"`
+	Status        string `json:"status"`
+}
+
+// discoverClineSessionID scans dataDir for a resume-capable session_id.
+// Real Cline NDJSON does not emit sessionId; disk is the source of truth for
+// --id. Returns "" when no acceptable match is found (no panic).
+// Never returns taskId/agentId-style values from hooks — only session_id from
+// session JSON files.
+func discoverClineSessionID(dataDir string, hints clineSessionMatchHints, logger *slog.Logger) string {
+	if strings.TrimSpace(dataDir) == "" {
+		return ""
+	}
+	candidates := listClineSessionFiles(dataDir)
+	if len(candidates) == 0 {
+		if logger != nil {
+			logger.Warn("cline: no session files under data-dir for SessionID discovery",
+				"data_dir", dataDir)
+		}
+		return ""
+	}
+
+	bestID := ""
+	bestScore := -1
+	for _, path := range candidates {
+		meta, err := readClineSessionFile(path)
+		if err != nil || meta == nil {
+			continue
+		}
+		id := strings.TrimSpace(meta.SessionID)
+		if id == "" {
+			// Fall back to parent directory name (sessions/<id>/<id>.json).
+			id = filepath.Base(filepath.Dir(path))
+		}
+		if !isClineResumeSessionID(id) {
+			continue
+		}
+		score := scoreClineSessionMatch(meta, hints)
+		if score > bestScore {
+			bestScore = score
+			bestID = id
+		}
+	}
+	if bestID == "" {
+		if logger != nil {
+			logger.Warn("cline: session files present but none matched discovery hints",
+				"data_dir", dataDir, "candidates", len(candidates))
+		}
+		return ""
+	}
+	// Require a positive score so an unrelated leftover session is not picked
+	// when hints cannot match (isolated data-dir usually has only this run).
+	if bestScore <= 0 && len(candidates) > 1 {
+		if logger != nil {
+			logger.Warn("cline: ambiguous session match with non-positive score",
+				"data_dir", dataDir, "best_score", bestScore)
+		}
+		return ""
+	}
+	// Single candidate under an isolated data-dir is always the run's session
+	// even when pid/cwd hints are weak (e.g. process already reaped).
+	if bestScore <= 0 && len(candidates) == 1 {
+		return bestID
+	}
+	if bestScore <= 0 {
+		return ""
+	}
+	return bestID
+}
+
+// isClineResumeSessionID rejects values that look like hook taskId/agentId
+// rather than Cline history / --id session identifiers.
+func isClineResumeSessionID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	lower := strings.ToLower(id)
+	if strings.HasPrefix(lower, "conv_") || strings.HasPrefix(lower, "agent_") {
+		return false
+	}
+	// Synthetic NDJSON-only fixtures used "ses_*"; real disk ids are
+	// timestamp_random (e.g. 1784085932547_muen6). We accept any non-empty
+	// id that is not an obvious hook id — do not require a prefix.
+	return true
+}
+
+func listClineSessionFiles(dataDir string) []string {
+	// Observed default: <data-dir>/data/sessions/<id>/<id>.json
+	// Tolerate <data-dir>/sessions/<id>/<id>.json as well.
+	roots := []string{
+		filepath.Join(dataDir, "data", "sessions"),
+		filepath.Join(dataDir, "sessions"),
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, ent := range entries {
+			if !ent.IsDir() {
+				continue
+			}
+			sessionDir := filepath.Join(root, ent.Name())
+			// Prefer <id>/<id>.json; also accept any non-messages *.json.
+			primary := filepath.Join(sessionDir, ent.Name()+".json")
+			if st, err := os.Stat(primary); err == nil && !st.IsDir() {
+				if _, ok := seen[primary]; !ok {
+					seen[primary] = struct{}{}
+					out = append(out, primary)
+				}
+				continue
+			}
+			files, err := os.ReadDir(sessionDir)
+			if err != nil {
+				continue
+			}
+			for _, f := range files {
+				if f.IsDir() {
+					continue
+				}
+				name := f.Name()
+				if !strings.HasSuffix(name, ".json") {
+					continue
+				}
+				if strings.HasSuffix(name, ".messages.json") {
+					continue
+				}
+				p := filepath.Join(sessionDir, name)
+				if _, ok := seen[p]; ok {
+					continue
+				}
+				seen[p] = struct{}{}
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+func readClineSessionFile(path string) (*clineSessionFile, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var meta clineSessionFile
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func scoreClineSessionMatch(meta *clineSessionFile, hints clineSessionMatchHints) int {
+	if meta == nil {
+		return 0
+	}
+	score := 0
+	// pid match is strongest (unique per concurrent run under isolated data-dir).
+	if hints.PID > 0 && meta.PID == hints.PID {
+		score += 100
+	}
+	cwd := strings.TrimSpace(hints.Cwd)
+	if cwd != "" {
+		if samePathLoose(meta.Cwd, cwd) || samePathLoose(meta.WorkspaceRoot, cwd) {
+			score += 40
+		}
+	}
+	if promptMatchesClineSession(meta.Prompt, hints.Prompt) {
+		score += 20
+	}
+	if started, ok := parseClineSessionTime(meta.StartedAt); ok {
+		// Allow small clock skew around the Multica-observed run window.
+		windowStart := hints.StartTime.Add(-2 * time.Minute)
+		windowEnd := hints.EndTime.Add(2 * time.Minute)
+		if !hints.EndTime.IsZero() && started.After(windowStart) && started.Before(windowEnd) {
+			score += 15
+		} else if hints.EndTime.IsZero() && !hints.StartTime.IsZero() && started.After(windowStart) {
+			score += 10
+		}
+	}
+	// Prefer completed-looking sessions when scores tie via tiny bias.
+	if strings.EqualFold(strings.TrimSpace(meta.Status), "completed") {
+		score += 1
+	}
+	return score
+}
+
+func samePathLoose(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	// Best-effort clean comparison without requiring paths to exist.
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func promptMatchesClineSession(diskPrompt, multicaPayload string) bool {
+	diskPrompt = strings.TrimSpace(diskPrompt)
+	multicaPayload = strings.TrimSpace(multicaPayload)
+	if diskPrompt == "" || multicaPayload == "" {
+		return false
+	}
+	// Cline wraps user input: <user_input mode="act">…</user_input>
+	inner := diskPrompt
+	if i := strings.Index(diskPrompt, ">"); i >= 0 && strings.Contains(diskPrompt, "<user_input") {
+		rest := diskPrompt[i+1:]
+		if j := strings.LastIndex(rest, "</user_input>"); j >= 0 {
+			inner = strings.TrimSpace(rest[:j])
+		}
+	}
+	if inner == multicaPayload || strings.Contains(diskPrompt, multicaPayload) {
+		return true
+	}
+	// Prefix match for long prompts truncated on disk.
+	const prefixN = 64
+	prefix := multicaPayload
+	if len(prefix) > prefixN {
+		prefix = prefix[:prefixN]
+	}
+	return strings.Contains(diskPrompt, prefix) || strings.Contains(inner, prefix)
+}
+
+func parseClineSessionTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	// Real files use RFC3339 / RFC3339Nano with Z.
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 // ── NDJSON (形态 B) ──
@@ -193,7 +561,6 @@ type clineScanResult struct {
 	status       string
 	errMsg       string
 	output       string
-	sessionID    string
 	usage        TokenUsage
 	sawRunResult bool
 	doneReason   string
@@ -247,9 +614,13 @@ type clineNestedEvent struct {
 
 // processEvents reads Cline 3.x NDJSON lines from r and maps them to Multica
 // Messages / terminal Result fields. Extracted for fixture-driven unit tests.
+//
+// Stream sessionId fields (when present) are intentionally ignored for
+// Result.SessionID: real Cline 3.x CLI NDJSON does not emit a resume-capable
+// id; disk discovery after Wait owns that field. Synthetic NDJSON sessionId
+// fixtures must not green-wash the resume contract.
 func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanResult {
 	var streamOut strings.Builder
-	var sessionID string
 	var usage TokenUsage
 	finalStatus := "completed"
 	var finalError string
@@ -258,19 +629,6 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 	var doneReason, doneText string
 	toolSeq := 0
 	var lastToolCallID string
-	sessionPinned := false
-
-	pinSession := func(id string) {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return
-		}
-		sessionID = id
-		if !sessionPinned {
-			sessionPinned = true
-			trySend(ch, Message{Type: MessageStatus, Status: "running", SessionID: id})
-		}
-	}
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
@@ -289,10 +647,6 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 			continue
 		}
 
-		// Prefer explicit sessionId fields only — bare "id" is ambiguous on
-		// non-run_result lines (tool call ids, etc.).
-		pinSession(env.SessionID)
-
 		switch env.Type {
 		case "agent_event":
 			var ev clineNestedEvent
@@ -301,7 +655,6 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 					continue
 				}
 			}
-			pinSession(ev.SessionID)
 
 			switch ev.Type {
 			case "content_start", "content_update", "content_end":
@@ -346,7 +699,6 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 					continue
 				}
 			}
-			pinSession(ev.SessionID)
 
 			switch ev.Type {
 			case "tool_call":
@@ -376,7 +728,7 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 					Output: out,
 				})
 			case "agent_start", "agent_end":
-				// Lifecycle only.
+				// Lifecycle only. hook taskId/agentId are not resume SessionIDs.
 			}
 
 		case "run_result":
@@ -410,8 +762,8 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 					CacheWriteTokens: u.CacheWriteTokens,
 				}
 			}
-			// run_result may surface session as sessionId or id.
-			pinSession(firstNonEmpty(env.SessionID, env.ID))
+			// Do not pin SessionID from run_result sessionId/id — real CLI
+			// omits them; synthetic values are not resume-capable --id tokens.
 
 		default:
 			// Unknown top-level type: skip.
@@ -444,7 +796,6 @@ func (b *clineBackend) processEvents(r io.Reader, ch chan<- Message) clineScanRe
 		status:       finalStatus,
 		errMsg:       finalError,
 		output:       output,
-		sessionID:    sessionID,
 		usage:        usage,
 		sawRunResult: sawRunResult,
 		doneReason:   doneReason,
