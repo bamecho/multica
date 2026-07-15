@@ -25,7 +25,10 @@ func TestNewReturnsClineBackend(t *testing.T) {
 func TestBuildClineArgsContract(t *testing.T) {
 	t.Parallel()
 	logger := slog.Default()
-	paths := clinePaths{DataDir: "/tmp/multica-cline-data-test"}
+	paths := clinePaths{
+		DataDir:   "/tmp/multica-cline-data-test",
+		ConfigDir: "/home/user/.cline-sr/data/settings",
+	}
 
 	args := buildClineArgs(ExecOptions{
 		Cwd:             "/work",
@@ -36,6 +39,7 @@ func TestBuildClineArgsContract(t *testing.T) {
 			"--json", "--auto-approve", "false",
 			"-c", "/evil", "--id", "x",
 			"--data-dir", "/evil-data",
+			"--config", "/evil-config",
 			"-s", "nope", "-t", "9", "-m", "other", "--verbose",
 		},
 	}, paths, logger)
@@ -51,8 +55,8 @@ func TestBuildClineArgsContract(t *testing.T) {
 	if !containsArgPair(args, "--data-dir", paths.DataDir) {
 		t.Errorf("missing Multica --data-dir in %v", args)
 	}
-	if containsArg(args, "--config") {
-		t.Errorf("Multica must not pass --config (CLI home default); got %v", args)
+	if !containsArgPair(args, "--config", paths.ConfigDir) {
+		t.Errorf("missing Multica --config in %v", args)
 	}
 	if !containsArgPair(args, "-c", "/work") {
 		t.Errorf("missing -c /work in %v", args)
@@ -80,7 +84,7 @@ func TestBuildClineArgsContract(t *testing.T) {
 		}
 	}
 	// Blocked custom overrides must not appear as user-controlled values
-	if strings.Contains(joined, "/evil") || strings.Contains(joined, "/evil-data") {
+	if strings.Contains(joined, "/evil") || strings.Contains(joined, "/evil-data") || strings.Contains(joined, "/evil-config") {
 		t.Errorf("blocked Multica-owned override survived: %v", args)
 	}
 	// Allowed custom arg survives
@@ -105,15 +109,43 @@ func TestBuildClineStdinPayload(t *testing.T) {
 
 func TestBuildClineArgsNoSystemPrompt(t *testing.T) {
 	t.Parallel()
-	args := buildClineArgs(ExecOptions{}, clinePaths{DataDir: "/tmp/d"}, slog.Default())
+	args := buildClineArgs(ExecOptions{}, clinePaths{
+		DataDir:   "/tmp/d",
+		ConfigDir: "/tmp/settings",
+	}, slog.Default())
 	if args[len(args)-1] != clineArgvPromptSentinel {
 		t.Fatalf("prompt sentinel = %q, want %q", args[len(args)-1], clineArgvPromptSentinel)
 	}
 	if !containsArgPair(args, "--data-dir", "/tmp/d") {
 		t.Errorf("expected --data-dir even without optional opts: %v", args)
 	}
+	if !containsArgPair(args, "--config", "/tmp/settings") {
+		t.Errorf("expected --config even without optional opts: %v", args)
+	}
 	if containsArg(args, "-c") || containsArg(args, "-m") || containsArg(args, "--id") {
 		t.Errorf("unexpected optional flags: %v", args)
+	}
+}
+
+func TestPrepareClinePathsPinsHomeConfig(t *testing.T) {
+	// Cannot Parallel: t.Setenv mutates process env for this test.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	paths, err := prepareClinePaths(ExecOptions{})
+	if err != nil {
+		t.Fatalf("prepareClinePaths: %v", err)
+	}
+	if paths.DataDir == "" {
+		t.Fatal("expected isolated data-dir")
+	}
+	wantConfig := filepath.Join(home, ".cline-sr", "data", "settings")
+	if paths.ConfigDir != wantConfig {
+		t.Fatalf("ConfigDir = %q, want %q", paths.ConfigDir, wantConfig)
+	}
+	// data-dir must not be nested under the home settings tree
+	if strings.HasPrefix(paths.DataDir, wantConfig) {
+		t.Errorf("data-dir %q must not live under config %q", paths.DataDir, wantConfig)
 	}
 }
 
@@ -425,11 +457,16 @@ func TestClineExecuteSkipsBadLines(t *testing.T) {
 }
 
 func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
-	t.Parallel()
+	// Cannot Parallel: t.Setenv mutates process env so --config resolves to a
+	// known home settings path for this test.
 	ndjson := `{"type":"run_result","finishReason":"completed","text":"ok"}` + "\n"
 	userPrompt := "user prompt with unique task token TASK_SECRET_42"
 	brief := "RUNTIME BRIEF with unique brief token BRIEF_SECRET_99"
 	wantPayload := brief + "\n\n" + userPrompt
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	wantConfig := filepath.Join(home, ".cline-sr", "data", "settings")
 
 	cap := runClineExecute(t, userPrompt, ndjson, ExecOptions{
 		Cwd:             t.TempDir(),
@@ -439,6 +476,7 @@ func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
 		CustomArgs: []string{
 			"--json", "-t", "99", "-s", "no",
 			"--data-dir", "/evil-data",
+			"--config", "/evil-config",
 			"--extra", "keep",
 		},
 	}, nil)
@@ -464,12 +502,12 @@ func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
 		if strings.Contains(line, "RUNTIME BRIEF") || strings.Contains(line, "TASK_SECRET") || strings.Contains(line, "BRIEF_SECRET") {
 			t.Errorf("payload text leaked onto argv element %q full=%v", line, lines)
 		}
-		if line == "/evil-data" {
-			t.Errorf("blocked data-dir override survived: %v", lines)
+		if line == "/evil-data" || line == "/evil-config" {
+			t.Errorf("blocked Multica-owned override survived: %v", lines)
 		}
 	}
-	if containsArg(lines, "--config") {
-		t.Errorf("must not pass --config: %v", lines)
+	if !containsArgPair(lines, "--config", wantConfig) {
+		t.Errorf("missing Multica --config %q in %v", wantConfig, lines)
 	}
 	if !containsArg(lines, "--data-dir") {
 		t.Errorf("missing Multica --data-dir: %v", lines)

@@ -1,6 +1,6 @@
 # 01 — Cline Session ID via Data-Dir Discovery
 
-**Status:** Implemented (2026-07-15) — P0: isolated `--data-dir` + post-exit disk discovery for `Result.SessionID`. P1 (persist data-dir / verified `--id` resume) not done.  
+**Status:** Implemented (2026-07-15) — P0: isolated `--data-dir` + post-exit disk discovery for `Result.SessionID`, paired with explicit `--config ~/.cline-sr/data/settings` so auth/model survive isolation. P1 (persist data-dir / verified `--id` resume) not done.  
 **Scope:** Obtain a resume-capable `sessionId` for Multica’s `cline` NDJSON backend  
 **Related:**
 

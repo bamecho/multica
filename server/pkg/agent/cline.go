@@ -25,12 +25,12 @@ const clineArgvPromptSentinel = "\n"
 // control plane (形态 B). Users must not override protocol transport, cwd,
 // session isolation/resume, system/timeout flags (v1 never passes -s/-t),
 // or model. Multica owns --data-dir for per-run isolation + disk SessionID
-// discovery (see plan 01).
+// discovery, and --config so auth/settings stay on the user's CLI home
+// settings tree even when data-dir is isolated (see plan 01).
 //
 // --auto-approve is not passed on argv (CLI default is true for headless
 // tool approval) but stays blocked so CustomArgs cannot force false and hang
-// a daemon run on interactive approval. --config is also omitted so the CLI
-// uses its home default settings.
+// a daemon run on interactive approval.
 var clineBlockedArgs = map[string]blockedArgMode{
 	"--json":         blockedStandalone,
 	"--auto-approve": blockedWithValue,
@@ -38,6 +38,7 @@ var clineBlockedArgs = map[string]blockedArgMode{
 	"--cwd":          blockedWithValue,
 	"--id":           blockedWithValue,
 	"--data-dir":     blockedWithValue,
+	"--config":       blockedWithValue,
 	"-s":             blockedWithValue,
 	"--system":       blockedWithValue,
 	"-t":             blockedWithValue,
@@ -81,6 +82,7 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		"argv_prompt", "newline_sentinel",
 		"stdin_bytes", len(payload),
 		"data_dir", paths.DataDir,
+		"config_dir", paths.ConfigDir,
 	)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
@@ -116,6 +118,7 @@ func (b *clineBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		"model", opts.Model,
 		"stdin_bytes", len(payload),
 		"data_dir", paths.DataDir,
+		"config_dir", paths.ConfigDir,
 	)
 
 	// Deliver full Multica payload on stdin and close for EOF. Concurrent with
@@ -253,11 +256,29 @@ func buildClineStdinPayload(prompt string, opts ExecOptions) string {
 type clinePaths struct {
 	// DataDir is the isolated --data-dir root (sessions live under data/sessions).
 	DataDir string
+	// ConfigDir is the authenticated settings tree passed as --config
+	// (default: ~/.cline-sr/data/settings for the Multica-targeted CLI home).
+	// Must be set explicitly: a fresh --data-dir has empty data/settings, so
+	// omitting --config forces the CLI to re-validate token/model interactively.
+	ConfigDir string
+}
+
+// defaultClineConfigDir returns the Multica Cline CLI home settings path
+// (~/.cline-sr/data/settings) under the current user's home directory.
+func defaultClineConfigDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cline: resolve home for --config: %w", err)
+	}
+	if strings.TrimSpace(home) == "" {
+		return "", fmt.Errorf("cline: empty home directory for --config")
+	}
+	return filepath.Join(home, ".cline-sr", "data", "settings"), nil
 }
 
 // prepareClinePaths chooses an isolated data-dir under the process temp base
-// (daemon sets TMPDIR per task). Auth/settings are left to the CLI default
-// --config (home); Multica does not pass --config.
+// (daemon sets TMPDIR per task) and pins --config to the user's CLI settings
+// so provider auth/model survive data-dir isolation.
 func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
 	// os.MkdirTemp honors TMPDIR; the daemon sets a per-task TMPDIR so this
 	// stays outside the user's project worktree (local_directory mode).
@@ -266,7 +287,11 @@ func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
 	if err != nil {
 		return clinePaths{}, fmt.Errorf("cline: create data-dir: %w", err)
 	}
-	return clinePaths{DataDir: dataDir}, nil
+	configDir, err := defaultClineConfigDir()
+	if err != nil {
+		return clinePaths{}, err
+	}
+	return clinePaths{DataDir: dataDir, ConfigDir: configDir}, nil
 }
 
 // buildClineArgs assembles argv for a headless Cline 3.x NDJSON run.
@@ -274,11 +299,15 @@ func prepareClinePaths(_ ExecOptions) (clinePaths, error) {
 // payload is written to stdin (see buildClineStdinPayload). No -s.
 // Timeout is owned by Multica runContext; -t is never passed (v1).
 // paths.DataDir is always passed as --data-dir for isolation + session discovery.
-// --auto-approve and --config are omitted (CLI defaults: approve tools; home settings).
+// paths.ConfigDir is always passed as --config so isolated data-dir does not
+// drop provider auth/settings. --auto-approve is omitted (CLI default true).
 func buildClineArgs(opts ExecOptions, paths clinePaths, logger *slog.Logger) []string {
 	args := []string{"--json"}
 	if paths.DataDir != "" {
 		args = append(args, "--data-dir", paths.DataDir)
+	}
+	if paths.ConfigDir != "" {
+		args = append(args, "--config", paths.ConfigDir)
 	}
 	if opts.Cwd != "" {
 		args = append(args, "-c", opts.Cwd)
