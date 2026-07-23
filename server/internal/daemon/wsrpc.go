@@ -29,6 +29,8 @@ var errWSRPCUncertain = errors.New("ws rpc: sent but outcome unknown (connection
 // daemon gives up (MUL-4257).
 const wsRPCResponseGrace = 2 * time.Second
 
+var wsClaimUncertainFallbackDelay = batchClaimRequestTimeout + wsRPCResponseGrace
+
 // errWSRPCWriteBufferFull is returned when the connection's write buffer is
 // saturated; the caller falls back to HTTP rather than blocking the socket.
 var errWSRPCWriteBufferFull = errors.New("ws rpc: write buffer full")
@@ -83,6 +85,11 @@ type wsRPCClient struct {
 	mu        sync.Mutex
 	pending   map[string]chan protocol.RPCResponsePayload
 	sendFrame func([]byte) (*wsOutbound, error)
+	// rpcV1Supported belongs to the currently attached connection. attach
+	// clears it before exposing a replacement sender so a claim that races a
+	// reconnect can never carry negotiation state across connections.
+	rpcV1Supported bool
+	generation     uint64
 	// grace is added to a call's server-side timeout budget to get how long the
 	// daemon waits for the response, so a claim that committed just before the
 	// server deadline still reports back before the daemon gives up (MUL-4257).
@@ -96,38 +103,82 @@ func newWSRPCClient(grace time.Duration) *wsRPCClient {
 	}
 }
 
-// attach binds a live connection's frame writer. Passing nil detaches (on
-// disconnect), after which Call fails fast until the next attach. Any pending
-// requests are failed so their callers fall back to HTTP immediately.
-func (c *wsRPCClient) attach(sendFrame func([]byte) (*wsOutbound, error)) {
+// attach binds a live connection's frame writer and clears the previous
+// connection's negotiated capability. Passing nil detaches (on disconnect),
+// after which Call fails fast until the next attach and rpc-v1 heartbeat ack.
+// Any pending requests are failed so their callers fall back to HTTP
+// immediately.
+func (c *wsRPCClient) attach(sendFrame func([]byte) (*wsOutbound, error)) uint64 {
 	c.mu.Lock()
+	c.generation++
+	c.rpcV1Supported = false
 	c.sendFrame = sendFrame
-	if sendFrame == nil {
-		for id, ch := range c.pending {
-			close(ch)
-			delete(c.pending, id)
-		}
+	for id, ch := range c.pending {
+		close(ch)
+		delete(c.pending, id)
+	}
+	generation := c.generation
+	c.mu.Unlock()
+	return generation
+}
+
+// markRPCV1Supported records explicit server support for the currently
+// attached connection. Heartbeat acks received without a live sender cannot
+// enable a future connection.
+func (c *wsRPCClient) markRPCV1Supported(generation uint64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.sendFrame != nil && c.generation == generation {
+		c.rpcV1Supported = true
 	}
 	c.mu.Unlock()
 }
 
-// connected reports whether a live connection is attached.
-func (c *wsRPCClient) connected() bool {
+func (c *wsRPCClient) currentGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}
+
+// supportsRPCV1 reports whether the live connection explicitly negotiated
+// rpc-v1. Call repeats this check while capturing the sender under the same
+// mutex, so this method is only a fast-path hint and cannot authorize a send by
+// itself.
+func (c *wsRPCClient) supportsRPCV1() bool {
 	if c == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.sendFrame != nil
+	return c.sendFrame != nil && c.rpcV1Supported
 }
 
-// Call issues an RPC and blocks until the response, the per-request timeout, or
-// ctx cancellation. reqBody is marshaled into the request envelope; on a 2xx
+// Call issues an RPC on any attached connection. Transport-level tests and
+// callers that have their own negotiation contract use this directly.
+func (c *wsRPCClient) Call(ctx context.Context, method string, serverTimeout time.Duration, reqBody, respBody any) (int, error) {
+	return c.call(ctx, method, serverTimeout, reqBody, respBody, false)
+}
+
+// CallIfRPCV1Supported issues an RPC only when the currently attached
+// connection explicitly negotiated rpc-v1. The capability check and sender
+// capture happen under the same mutex, so a reconnect cannot redirect a call
+// authorized by the previous connection onto its replacement.
+func (c *wsRPCClient) CallIfRPCV1Supported(ctx context.Context, method string, serverTimeout time.Duration, reqBody, respBody any) (int, error) {
+	return c.call(ctx, method, serverTimeout, reqBody, respBody, true)
+}
+
+// call blocks until the response, the per-request timeout, or ctx
+// cancellation. reqBody is marshaled into the request envelope; on a 2xx
 // response respBody (if non-nil) is unmarshaled from the response body. It
 // returns the response status (0 when the call never reached the server) so the
-// caller can distinguish transport failure (→ HTTP fallback) from a server-side
-// error.
-func (c *wsRPCClient) Call(ctx context.Context, method string, serverTimeout time.Duration, reqBody, respBody any) (int, error) {
+// caller can distinguish transport failure (→ HTTP fallback) from a
+// server-side error.
+func (c *wsRPCClient) call(ctx context.Context, method string, serverTimeout time.Duration, reqBody, respBody any, requireRPCV1 bool) (int, error) {
 	if c == nil {
 		return 0, errWSRPCUnavailable
 	}
@@ -155,7 +206,7 @@ func (c *wsRPCClient) Call(ctx context.Context, method string, serverTimeout tim
 
 	ch := make(chan protocol.RPCResponsePayload, 1)
 	c.mu.Lock()
-	if c.sendFrame == nil {
+	if c.sendFrame == nil || (requireRPCV1 && !c.rpcV1Supported) {
 		c.mu.Unlock()
 		return 0, errWSRPCUnavailable
 	}
@@ -255,10 +306,12 @@ func (c *wsRPCClient) deliver(resp protocol.RPCResponsePayload) {
 
 // ClaimTasksWSFirst is the WS-first claim policy (MUL-4257): it issues the
 // tasks.claim RPC over the WS control connection when one is attached, and
-// falls back to the HTTP claim endpoint on any transport failure (no
-// connection, write-buffer full, timeout) or server error. The request/response
-// bodies are identical to the HTTP endpoint so both transports are
-// interchangeable. Wired into the claim poller as part of the poller cutover.
+// falls back to the HTTP claim endpoint on transport failures that are known not
+// to have reached the server (no connection, write-buffer full, unsent timeout)
+// or server error. A sent-frame disconnect/timeout is uncertain, so it is
+// retried over HTTP only after a short safety window. The request/response bodies
+// are identical to the HTTP endpoint so both transports are interchangeable.
+// Wired into the claim poller as part of the poller cutover.
 func (d *Daemon) ClaimTasksWSFirst(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
 	// Un-upgraded server without the batch route: a prior poll already learned
 	// this (via a 404), so go straight to the legacy per-runtime claim and skip
@@ -266,13 +319,27 @@ func (d *Daemon) ClaimTasksWSFirst(ctx context.Context, daemonID string, runtime
 	if d.batchClaimUnsupported.Load() {
 		return d.client.claimTasksLegacy(ctx, runtimeIDs, maxTasks)
 	}
-	if d.wsRPC.connected() {
+	bypassWSOnce := false
+	if retryAfterNanos := d.wsClaimHTTPFallbackAfter.Load(); retryAfterNanos > 0 {
+		retryAfter := time.Unix(0, retryAfterNanos)
+		now := time.Now()
+		if now.Before(retryAfter) {
+			d.logger.Debug("ws claim outcome uncertain; delaying http fallback until safety window elapses",
+				"retry_after", retryAfter.Sub(now).Round(time.Millisecond))
+			return nil, nil
+		}
+		if d.wsClaimHTTPFallbackAfter.CompareAndSwap(retryAfterNanos, 0) {
+			bypassWSOnce = true
+			d.logger.Debug("previous ws claim outcome uncertain; using http fallback for this claim cycle")
+		}
+	}
+	if !bypassWSOnce && d.wsRPC.supportsRPCV1() {
 		var resp struct {
 			Tasks []*Task `json:"tasks"`
 		}
 		// batchClaimRequestTimeout is the server-side execution budget; the
 		// daemon waits that plus the client's grace margin for the response.
-		_, err := d.wsRPC.Call(ctx, "tasks.claim", batchClaimRequestTimeout, map[string]any{
+		_, err := d.wsRPC.CallIfRPCV1Supported(ctx, "tasks.claim", batchClaimRequestTimeout, map[string]any{
 			"daemon_id":   daemonID,
 			"runtime_ids": runtimeIDs,
 			"max_tasks":   maxTasks,
@@ -282,10 +349,17 @@ func (d *Daemon) ClaimTasksWSFirst(ctx context.Context, daemonID string, runtime
 		}
 		if errors.Is(err, errWSRPCUncertain) {
 			// The WS claim may have committed server-side; claiming the same
-			// free slots again over HTTP would double-claim. Skip this cycle —
-			// an orphaned server-side claim is recovered by stale reclaim and
-			// the next poll picks up anything still queued.
-			d.logger.Debug("ws claim outcome uncertain after disconnect; skipping fallback this cycle")
+			// free slots again over HTTP immediately would double-claim. Skip
+			// this cycle, then force one HTTP batch claim after the server-side
+			// execution budget plus response grace has elapsed. If the WS claim
+			// committed, the task is already dispatched and stale reclaim owns
+			// recovery; if it did not, HTTP regains liveness for the queued task.
+			delay := wsClaimUncertainFallbackDelay
+			if delay < 0 {
+				delay = 0
+			}
+			d.wsClaimHTTPFallbackAfter.Store(time.Now().Add(delay).UnixNano())
+			d.logger.Debug("ws claim outcome uncertain after disconnect; delaying http fallback", "retry_after", delay)
 			return nil, nil
 		}
 		d.logger.Debug("ws claim failed; falling back to http", "error", err)

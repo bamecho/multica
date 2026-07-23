@@ -122,6 +122,11 @@ export interface AutopilotRun {
   triggered_at: string;
   completed_at: string | null;
   failure_reason: string | null;
+  // Stable, localizable, enumeration-safe classification of a non-success run
+  // (skipped/failed), derived server-side from failure_reason (MUL-4525). The
+  // "run now" UI localizes this instead of echoing the raw English reason.
+  // Older servers omit it.
+  reason_code?: string;
   trigger_payload: unknown;
   result: unknown;
   created_at: string;
@@ -177,6 +182,14 @@ export interface UpdateAutopilotTriggerRequest {
   label?: string;
   // event_filters is only meaningful for webhook triggers.
   event_filters?: WebhookEventFilter[] | null;
+}
+
+export interface CronPreviewResponse {
+  // Next occurrences as RFC3339 UTC timestamps, ascending. An empty array
+  // means the expression never fires; `null` is the client-side sentinel for
+  // "the response could not be read" (schema drift), which callers must not
+  // present as "never fires".
+  next_runs: string[] | null;
 }
 
 export interface ListAutopilotsResponse {

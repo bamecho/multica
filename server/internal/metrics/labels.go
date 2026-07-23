@@ -59,6 +59,7 @@ var businessMetricLabels = map[string][]string{
 	"multica_team_invite_accepted_total":               {},
 	"multica_onboarding_started_total":                 {labelPlatform},
 	"multica_onboarding_questionnaire_submitted_total": {},
+	"multica_onboarding_source_submitted_total":        {},
 	"multica_onboarding_completed_total":               {labelPath},
 	"multica_cloud_waitlist_joined_total":              {},
 	"multica_issue_created_total":                      {labelSource, labelPlatform},
@@ -84,6 +85,7 @@ var businessMetricLabels = map[string][]string{
 	"multica_cloudruntime_request_duration_seconds":    {labelOp},
 	"multica_feedback_submitted_total":                 {labelKind, labelPlatform},
 	"multica_contact_sales_submitted_total":            {labelSource},
+	"multica_chat_output_local_path_total":             {labelKind},
 }
 
 var forbiddenMetricLabels = map[string]struct{}{
@@ -121,6 +123,7 @@ var (
 		"copilot":       "copilot",
 		"cursor":        "cursor",
 		"gemini":        "gemini",
+		"grok":          "grok",
 		"hermes":        "hermes",
 		"kiro":          "kiro",
 		"kimi":          "kimi",
@@ -129,6 +132,7 @@ var (
 		"opencode":      "opencode",
 		"deveco":        "deveco",
 		"pi":            "pi",
+		"qwen":          "qwen",
 		"other":         "other",
 	}
 	knownTerminalStatuses = map[string]string{

@@ -1,14 +1,67 @@
-import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import {
+  ModeChooser,
   buildInvocationTargets,
   decodeBuilderInput,
   deriveDuplicateAccess,
   encodeBuilderInput,
+  getAgentCreationScreenKey,
   mergeBuilderDraft,
   parseBuilderDraft,
+  pickBuilderRestore,
   stripBuilderDraft,
   type AgentDraft,
 } from "./agent-creation-studio";
+
+vi.mock("../../i18n", () => ({
+  useT: () => ({
+    t: (
+      selector: (translations: {
+        creation_studio: {
+          eyebrow: string;
+          choose_title: string;
+          choose_description: string;
+          recommended: string;
+          continue: string;
+          modes: {
+            blank: { title: string; description: string };
+            ai: { title: string; description: string };
+          };
+        };
+      }) => string,
+    ) =>
+      selector({
+        creation_studio: {
+          eyebrow: "Agent creation",
+          choose_title: "How would you like to start?",
+          choose_description: "Choose a creation mode.",
+          recommended: "Recommended",
+          continue: "Continue",
+          modes: {
+            blank: {
+              title: "Start blank",
+              description: "Configure every field yourself.",
+            },
+            ai: {
+              title: "Build with AI",
+              description: "Describe the outcome you want.",
+            },
+          },
+        },
+      }),
+  }),
+}));
+
+describe("Agent creation studio screen keys", () => {
+  it("groups configuration modes and separates the AI setup and builder", () => {
+    expect(getAgentCreationScreenKey("blank", "")).toBe("configure");
+    expect(getAgentCreationScreenKey("template", "")).toBe("configure");
+    expect(getAgentCreationScreenKey("ai", "")).toBe("ai-setup");
+    expect(getAgentCreationScreenKey("ai", "session-1")).toBe("ai-builder");
+  });
+});
 
 const draft = (): AgentDraft => ({
   name: "Old name",
@@ -21,6 +74,20 @@ const draft = (): AgentDraft => ({
   permissionScope: "private",
   memberIds: new Set(),
   teamIds: new Set(),
+});
+
+describe("Agent creation studio mode chooser", () => {
+  it("always offers AI-assisted creation", () => {
+    render(
+      createElement(ModeChooser, {
+        onBlank: vi.fn(),
+        onAI: vi.fn(),
+      }),
+    );
+
+    expect(screen.getByText("Start blank")).toBeInTheDocument();
+    expect(screen.getByText("Build with AI")).toBeInTheDocument();
+  });
 });
 
 describe("Agent creation studio builder protocol", () => {
@@ -73,6 +140,39 @@ Return findings."}</agent_draft>`;
     expect(decodeBuilderInput("ordinary chat message")).toBe(
       "ordinary chat message",
     );
+  });
+
+  // The builder chat is a real chat_session, so cancelling a started-but-empty
+  // run defers the empty/non-empty judgment (#5219): the cancel response carries
+  // no restore_to_input and the prompt arrives later as a durable draft-restore
+  // row holding the ENCODED message. Handing that to the composer raw would show
+  // the user a wall of JSON instead of the sentence they typed.
+  it("decodes a durable draft restore before the builder composer adopts it", () => {
+    const encoded = encodeBuilderInput(
+      "Create a release manager",
+      draft(),
+      [],
+      [],
+      { id: "runtime-1", name: "Codex", provider: "codex" },
+      [],
+    );
+
+    expect(pickBuilderRestore(null, { id: "msg-1", content: encoded })).toEqual({
+      id: "msg-1",
+      content: "Create a release manager",
+    });
+    expect(pickBuilderRestore(null, null)).toBeNull();
+  });
+
+  // The synchronous answer (task never started) is already decoded and already
+  // in hand; it must not be displaced by a durable row for the same cancel.
+  it("prefers the synchronous cancel answer over a durable restore", () => {
+    expect(
+      pickBuilderRestore(
+        { id: "msg-1", content: "Create a release manager" },
+        { id: "msg-1", content: "should not win" },
+      ),
+    ).toEqual({ id: "msg-1", content: "Create a release manager" });
   });
 
   it("merges safe fields and rejects unknown workspace references", () => {
