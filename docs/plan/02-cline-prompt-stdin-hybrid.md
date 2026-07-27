@@ -1,10 +1,13 @@
 # 02 — Cline Long Prompt via Stdin + Newline Argv Sentinel
 
-**Status:** Implemented (2026-07-15)  
+**Status:** **Obsolete as a standalone plan (2026-07-24). Do not use as a
+source of truth.** The implemented stdin transport is retained and consolidated
+in [`04-cline-dedicated-hub-per-run.md`](./04-cline-dedicated-hub-per-run.md).
 **Scope:** Avoid OS command-line length limits when launching Cline with Multica runtime brief + user prompt  
 **Related:**
 
-- [`docs/plan/01-cline-session-id-data-dir.md`](./01-cline-session-id-data-dir.md) — session id discovery (orthogonal)
+- [`docs/plan/04-cline-dedicated-hub-per-run.md`](./04-cline-dedicated-hub-per-run.md) — confirmed launch, prompt, session, and resume design
+- [`docs/plan/01-cline-session-id-data-dir.md`](./01-cline-session-id-data-dir.md) — historical data-dir session approach
 - [`docs/cline-ndjson-multica-adapter-plan.md`](../cline-ndjson-multica-adapter-plan.md) — current adapter puts combined prompt on argv
 - Backend: `server/pkg/agent/cline.go` (`buildClineArgs`)
 - Daemon: `providerNeedsInlineSystemPrompt("cline")` → `ExecOptions.SystemPrompt = runtimeBrief`

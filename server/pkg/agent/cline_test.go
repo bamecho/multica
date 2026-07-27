@@ -2,38 +2,17 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"log/slog"
 )
-
-// init installs a package-local settings fixture so Execute / prepareClinePaths
-// tests do not require a real ~/.cline-sr. Production ignores this override
-// unless tests set clineSettingsSourceDirOverride (this init does).
-func init() {
-	if strings.TrimSpace(clineSettingsSourceDirOverride) != "" {
-		return
-	}
-	dir, err := os.MkdirTemp("", "multica-cline-test-settings-*")
-	if err != nil {
-		panic("cline test settings: " + err.Error())
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		panic(err)
-	}
-	providers := []byte(`{"providers":[{"id":"test","apiKey":"sk-test"}]}`)
-	if err := os.WriteFile(filepath.Join(dir, "providers.json"), providers, 0o600); err != nil {
-		panic(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "global-settings.json"), []byte(`{"theme":"dark"}`), 0o600); err != nil {
-		panic(err)
-	}
-	clineSettingsSourceDirOverride = dir
-}
 
 func TestNewReturnsClineBackend(t *testing.T) {
 	t.Parallel()
@@ -49,8 +28,6 @@ func TestNewReturnsClineBackend(t *testing.T) {
 func TestBuildClineArgsContract(t *testing.T) {
 	t.Parallel()
 	logger := slog.Default()
-	paths := clinePaths{DataDir: "/tmp/multica-cline-data-test"}
-
 	args := buildClineArgs(ExecOptions{
 		Cwd:             "/work",
 		Model:           "gpt-test",
@@ -63,7 +40,7 @@ func TestBuildClineArgsContract(t *testing.T) {
 			"--config", "/evil-config",
 			"-s", "nope", "-t", "9", "-m", "other", "--verbose",
 		},
-	}, paths, logger)
+	}, logger)
 
 	joined := strings.Join(args, "\x00")
 	// Required fixed flags
@@ -73,8 +50,8 @@ func TestBuildClineArgsContract(t *testing.T) {
 	if containsArg(args, "--auto-approve") {
 		t.Errorf("Multica must not pass --auto-approve (CLI default true); got %v", args)
 	}
-	if !containsArgPair(args, "--data-dir", paths.DataDir) {
-		t.Errorf("missing Multica --data-dir in %v", args)
+	if containsArg(args, "--data-dir") {
+		t.Errorf("resume must not use a private data-dir: %v", args)
 	}
 	if containsArg(args, "--config") {
 		t.Errorf("Multica must not pass --config (sandbox seeds settings); got %v", args)
@@ -130,12 +107,12 @@ func TestBuildClineStdinPayload(t *testing.T) {
 
 func TestBuildClineArgsNoSystemPrompt(t *testing.T) {
 	t.Parallel()
-	args := buildClineArgs(ExecOptions{}, clinePaths{DataDir: "/tmp/d"}, slog.Default())
+	args := buildClineArgs(ExecOptions{}, slog.Default())
 	if args[len(args)-1] != clineArgvPromptSentinel {
 		t.Fatalf("prompt sentinel = %q, want %q", args[len(args)-1], clineArgvPromptSentinel)
 	}
-	if !containsArgPair(args, "--data-dir", "/tmp/d") {
-		t.Errorf("expected --data-dir even without optional opts: %v", args)
+	if containsArg(args, "--data-dir") {
+		t.Errorf("unexpected --data-dir: %v", args)
 	}
 	if containsArg(args, "--config") {
 		t.Errorf("must not pass --config: %v", args)
@@ -145,107 +122,10 @@ func TestBuildClineArgsNoSystemPrompt(t *testing.T) {
 	}
 }
 
-// writeClineSettingsFixture creates a settings dir with providers.json (+ optional extra).
-func writeClineSettingsFixture(t *testing.T, dir string, providersBody string, extra map[string]string) {
-	t.Helper()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir settings: %v", err)
-	}
-	if providersBody == "" {
-		providersBody = `{"providers":[{"id":"openai-compatible","apiKey":"sk-test"}]}`
-	}
-	if err := os.WriteFile(filepath.Join(dir, "providers.json"), []byte(providersBody), 0o600); err != nil {
-		t.Fatalf("write providers.json: %v", err)
-	}
-	for name, body := range extra {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", name, err)
-		}
-	}
-}
-
-func TestPrepareClinePathsSeedsSettingsIntoDataDir(t *testing.T) {
-	t.Parallel()
-	// Uses package-local fixture from init (clineSettingsSourceDirOverride).
-	src := strings.TrimSpace(clineSettingsSourceDirOverride)
-	if src == "" {
-		t.Fatal("clineSettingsSourceDirOverride not set by package init")
-	}
-
-	paths, err := prepareClinePaths(ExecOptions{})
-	if err != nil {
-		t.Fatalf("prepareClinePaths: %v", err)
-	}
-	if paths.DataDir == "" {
-		t.Fatal("expected isolated data-dir")
-	}
-	if paths.SettingsSource != src {
-		t.Fatalf("SettingsSource = %q, want %q", paths.SettingsSource, src)
-	}
-	// Seeded into both sandbox layouts.
-	for _, rel := range []string{
-		filepath.Join("settings", "providers.json"),
-		filepath.Join("data", "settings", "providers.json"),
-		filepath.Join("settings", "global-settings.json"),
-		filepath.Join("data", "settings", "global-settings.json"),
-	} {
-		got, err := os.ReadFile(filepath.Join(paths.DataDir, rel))
-		if err != nil {
-			t.Fatalf("seeded file %s: %v", rel, err)
-		}
-		if strings.Contains(rel, "providers") && !strings.Contains(string(got), "sk-test") {
-			t.Errorf("%s content = %q, want seeded providers", rel, got)
-		}
-		if strings.Contains(rel, "global-settings") && !strings.Contains(string(got), "dark") {
-			t.Errorf("%s content = %q, want global-settings seed", rel, got)
-		}
-	}
-	if strings.HasPrefix(paths.DataDir, src) {
-		t.Errorf("data-dir %q must not live under settings source %q", paths.DataDir, src)
-	}
-}
-
-func TestSeedClineSettingsRequiresProvidersJSON(t *testing.T) {
-	t.Parallel()
-	empty := t.TempDir()
-	dataDir := t.TempDir()
-	err := seedClineSettingsIntoDataDir(dataDir, empty)
-	if err == nil {
-		t.Fatal("expected error when providers.json missing")
-	}
-	if !strings.Contains(err.Error(), "providers.json") {
-		t.Fatalf("error = %v, want providers.json mention", err)
-	}
-}
-
-func TestSeedClineSettingsIntoDataDir(t *testing.T) {
-	t.Parallel()
-	src := t.TempDir()
-	writeClineSettingsFixture(t, src, `{"k":1}`, map[string]string{"extra.json": `{"e":true}`})
-	dataDir := t.TempDir()
-	if err := seedClineSettingsIntoDataDir(dataDir, src); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	for _, p := range []string{
-		filepath.Join(dataDir, "settings", "providers.json"),
-		filepath.Join(dataDir, "data", "settings", "providers.json"),
-		filepath.Join(dataDir, "settings", "extra.json"),
-	} {
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("missing seeded %s: %v", p, err)
-		}
-	}
-}
-
 // fakeClineNDJSONScript writes argv to CLINE_ARGS_FILE, stdin to
 // CLINE_STDIN_FILE, and emits the NDJSON stream from CLINE_STDOUT_FILE (or a
 // built-in success stream). Exit code from CLINE_EXIT_CODE (default 0).
 // Stderr from CLINE_STDERR if set.
-//
-// When CLINE_WRITE_SESSION=1, writes a real-shaped session JSON under the
-// --data-dir passed on argv (data/sessions/<id>/<id>.json) using this shell's
-// PID so Multica post-exit discovery can recover a resume-capable session_id.
-// Session id defaults to CLINE_SESSION_ID or 1784999999999_testhost.
 func fakeClineNDJSONScript() string {
 	// Args are NUL-delimited so multi-line values survive round-trip.
 	// Stdin is captured fully (may contain newlines) for payload asserts.
@@ -253,44 +133,15 @@ func fakeClineNDJSONScript() string {
 if [ -n "$CLINE_ARGS_FILE" ]; then
   printf '%s\0' "$@" > "$CLINE_ARGS_FILE"
 fi
+if [ -n "$CLINE_ENV_FILE" ]; then
+  env | sort > "$CLINE_ENV_FILE"
+fi
 STDIN_BODY=""
 if [ -n "$CLINE_STDIN_FILE" ]; then
   cat > "$CLINE_STDIN_FILE"
   STDIN_BODY=$(cat "$CLINE_STDIN_FILE")
 else
   STDIN_BODY=$(cat)
-fi
-# Parse --data-dir and -c from argv for optional session file write.
-DATA_DIR=""
-CWD=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "--data-dir" ]; then DATA_DIR="$a"; fi
-  if [ "$prev" = "-c" ] || [ "$prev" = "--cwd" ]; then CWD="$a"; fi
-  prev="$a"
-done
-if [ "$CLINE_WRITE_SESSION" = "1" ] && [ -n "$DATA_DIR" ]; then
-  SID="${CLINE_SESSION_ID:-1784999999999_testhost}"
-  SDIR="$DATA_DIR/data/sessions/$SID"
-  mkdir -p "$SDIR"
-  # Escape JSON string content for prompt (minimal).
-  PROMPT_ESC=$(printf '%s' "$STDIN_BODY" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
-  STARTED=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
-  printf '%s\n' "{
-  \"version\": 1,
-  \"session_id\": \"$SID\",
-  \"source\": \"cli\",
-  \"pid\": $$,
-  \"started_at\": \"$STARTED\",
-  \"ended_at\": \"$STARTED\",
-  \"exit_code\": 0,
-  \"status\": \"completed\",
-  \"cwd\": \"$CWD\",
-  \"workspace_root\": \"$CWD\",
-  \"prompt\": \"<user_input mode=\\\"act\\\">$PROMPT_ESC</user_input>\",
-  \"provider\": \"openai-compatible\",
-  \"model\": \"test-model\"
-}" > "$SDIR/$SID.json"
 fi
 if [ -n "$CLINE_STDERR" ]; then
   printf '%s\n' "$CLINE_STDERR" >&2
@@ -308,10 +159,14 @@ exit "${CLINE_EXIT_CODE:-0}"
 }
 
 type clineExecCapture struct {
-	messages []Message
-	result   Result
-	argsFile string
-	stdinFile string
+	messages     []Message
+	result       Result
+	argsFile     string
+	stdinFile    string
+	envFile      string
+	hubStarts    int
+	hubStops     int
+	historyCalls int
 }
 
 func runClineWithStdout(t *testing.T, ndjson string, opts ExecOptions, env map[string]string) (messages []Message, result Result, argsFile string) {
@@ -322,7 +177,6 @@ func runClineWithStdout(t *testing.T, ndjson string, opts ExecOptions, env map[s
 
 func runClineExecute(t *testing.T, prompt, ndjson string, opts ExecOptions, env map[string]string) clineExecCapture {
 	t.Helper()
-	// Execute → prepareClinePaths seeds settings via package test fixture.
 	tempDir := t.TempDir()
 	fakePath := filepath.Join(tempDir, "cline")
 	writeTestExecutable(t, fakePath, []byte(fakeClineNDJSONScript()))
@@ -333,11 +187,14 @@ func runClineExecute(t *testing.T, prompt, ndjson string, opts ExecOptions, env 
 	}
 	argsFile := filepath.Join(tempDir, "argv.txt")
 	stdinFile := filepath.Join(tempDir, "stdin.txt")
+	envFile := filepath.Join(tempDir, "env.txt")
 
 	merged := map[string]string{
 		"CLINE_ARGS_FILE":   argsFile,
 		"CLINE_STDIN_FILE":  stdinFile,
 		"CLINE_STDOUT_FILE": stdoutFile,
+		"CLINE_ENV_FILE":    envFile,
+		"TMPDIR":            tempDir,
 	}
 	for k, v := range env {
 		merged[k] = v
@@ -350,6 +207,70 @@ func runClineExecute(t *testing.T, prompt, ndjson string, opts ExecOptions, env 
 	})
 	if err != nil {
 		t.Fatalf("New(cline): %v", err)
+	}
+	cline := backend.(*clineBackend)
+	var lifecycleMu sync.Mutex
+	hubStarts := 0
+	hubStops := 0
+	cline.startFreshHub = func(_ context.Context, _ string, _ string, extra map[string]string, taskTempDir string) (*clineHub, error) {
+		lifecycleMu.Lock()
+		hubStarts++
+		lifecycleMu.Unlock()
+		runtimeInfo := clineHubRuntime{
+			RuntimeDir:    filepath.Join(taskTempDir, "cline-hub", "fake-run"),
+			DiscoveryPath: filepath.Join(taskTempDir, "cline-hub", "fake-run", "production.json"),
+		}
+		record := clineHubRecord{
+			HubID:           "fake-hub",
+			ProtocolVersion: "v1",
+			Host:            "127.0.0.1",
+			Port:            32145,
+			URL:             "ws://127.0.0.1:32145/hub",
+			PID:             4242,
+			StartedAt:       time.Now(),
+		}
+		return &clineHub{
+			runtime:   runtimeInfo,
+			discovery: record,
+			status:    record,
+			env:       buildClineFreshHubEnv(extra, runtimeInfo.DiscoveryPath, record),
+			stopFn: func(context.Context) error {
+				lifecycleMu.Lock()
+				hubStops++
+				lifecycleMu.Unlock()
+				return nil
+			},
+		}, nil
+	}
+	var historyMu sync.Mutex
+	historyCalls := 0
+	cline.runFreshHistory = func(context.Context, string, string, []string) ([]clineHistoryEntry, error) {
+		historyMu.Lock()
+		defer historyMu.Unlock()
+		historyCalls++
+		if env["CLINE_TEST_HISTORY_ERROR"] == "1" {
+			return nil, fmt.Errorf("test history failure")
+		}
+		sessionID := strings.TrimSpace(env["CLINE_TEST_HISTORY_SESSION_ID"])
+		if sessionID == "" || historyCalls == 1 {
+			return nil, nil
+		}
+		startedMs, ok := parseClineSessionIDTimestamp(sessionID)
+		if !ok {
+			return nil, fmt.Errorf("invalid test SessionID %q", sessionID)
+		}
+		startedAt := time.UnixMilli(startedMs)
+		cli := "cli"
+		falseValue := false
+		return []clineHistoryEntry{{
+			SessionID:   sessionID,
+			PID:         4242,
+			Source:      &cli,
+			Interactive: &falseValue,
+			IsSubagent:  &falseValue,
+			Cwd:         opts.Cwd,
+			StartedAt:   &startedAt,
+		}}, nil
 	}
 	if opts.Timeout == 0 {
 		opts.Timeout = 5 * time.Second
@@ -371,18 +292,68 @@ func runClineExecute(t *testing.T, prompt, ndjson string, opts ExecOptions, env 
 	}()
 	result := <-session.Result
 	<-done
+	lifecycleMu.Lock()
+	starts, stops := hubStarts, hubStops
+	lifecycleMu.Unlock()
+	historyMu.Lock()
+	completedHistoryCalls := historyCalls
+	historyMu.Unlock()
 	return clineExecCapture{
-		messages:  messages,
-		result:    result,
-		argsFile:  argsFile,
-		stdinFile: stdinFile,
+		messages:     messages,
+		result:       result,
+		argsFile:     argsFile,
+		stdinFile:    stdinFile,
+		envFile:      envFile,
+		hubStarts:    starts,
+		hubStops:     stops,
+		historyCalls: completedHistoryCalls,
+	}
+}
+
+func TestClineExecuteHubStartFailureDoesNotStartTask(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	fakePath := filepath.Join(tempDir, "cline")
+	startedPath := filepath.Join(tempDir, "task-started")
+	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\nprintf started > \"$CLINE_TASK_STARTED\"\n"))
+	backend := &clineBackend{
+		cfg: Config{
+			ExecutablePath: fakePath,
+			Logger:         slog.Default(),
+			Env: map[string]string{
+				"TMPDIR":             tempDir,
+				"CLINE_TASK_STARTED": startedPath,
+			},
+		},
+		startFreshHub: func(context.Context, string, string, map[string]string, string) (*clineHub, error) {
+			return nil, fmt.Errorf("readiness failed")
+		},
+	}
+	if _, err := backend.Execute(context.Background(), "prompt", ExecOptions{}); err == nil || !strings.Contains(err.Error(), "readiness failed") {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if _, err := os.Stat(startedPath); !os.IsNotExist(err) {
+		t.Fatalf("task executable ran after Hub failure: %v", err)
+	}
+}
+
+func TestClineExecuteHistoryFailureDoesNotFailTask(t *testing.T) {
+	t.Parallel()
+	cap := runClineExecute(t, "prompt", `{"type":"run_result","ts":1784999999999,"finishReason":"completed","text":"ok"}`+"\n", ExecOptions{}, map[string]string{
+		"CLINE_TEST_HISTORY_ERROR": "1",
+	})
+	if cap.result.Status != "completed" || cap.result.Output != "ok" || cap.result.SessionID != "" {
+		t.Fatalf("result = %+v", cap.result)
+	}
+	if cap.hubStarts != 1 || cap.hubStops != 1 || cap.historyCalls != 1 {
+		t.Fatalf("lifecycle: starts=%d stops=%d history=%d", cap.hubStarts, cap.hubStops, cap.historyCalls)
 	}
 }
 
 func TestClineExecuteSuccessTextAndUsage(t *testing.T) {
 	t.Parallel()
 	// Synthetic NDJSON sessionId is not the real CLI contract and must not
-	// become Result.SessionID. Resume id comes only from disk discovery.
+	// become Result.SessionID. Fresh IDs come only from exact Hub history.
 	ndjson := strings.Join([]string{
 		`{"type":"hook_event","event":{"type":"agent_start"},"sessionId":"ses_early"}`,
 		`{"type":"agent_event","event":{"type":"iteration_start","iteration":1}}`,
@@ -567,6 +538,9 @@ func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
 	if cap.result.Status != "completed" {
 		t.Fatalf("status=%q error=%q", cap.result.Status, cap.result.Error)
 	}
+	if cap.hubStarts != 0 || cap.hubStops != 0 || cap.historyCalls != 0 {
+		t.Fatalf("resume touched fresh lifecycle: starts=%d stops=%d history=%d", cap.hubStarts, cap.hubStops, cap.historyCalls)
+	}
 	raw, err := os.ReadFile(cap.argsFile)
 	if err != nil {
 		t.Fatalf("read args: %v", err)
@@ -593,22 +567,8 @@ func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
 	if containsArg(lines, "--config") {
 		t.Errorf("must not pass --config (settings seeded into data-dir): %v", lines)
 	}
-	if !containsArg(lines, "--data-dir") {
-		t.Errorf("missing Multica --data-dir: %v", lines)
-	}
-	// data-dir must be Multica-owned temp, not user override; settings must be seeded.
-	dataDir := argValueAfter(lines, "--data-dir")
-	if dataDir == "" || dataDir == "/evil-data" {
-		t.Errorf("data-dir = %q, want isolated temp path", dataDir)
-	} else {
-		seeded := filepath.Join(dataDir, "settings", "providers.json")
-		if _, err := os.Stat(seeded); err != nil {
-			t.Errorf("expected seeded providers at %s: %v", seeded, err)
-		}
-		seededNested := filepath.Join(dataDir, "data", "settings", "providers.json")
-		if _, err := os.Stat(seededNested); err != nil {
-			t.Errorf("expected nested seeded providers at %s: %v", seededNested, err)
-		}
+	if containsArg(lines, "--data-dir") {
+		t.Errorf("resume must not use --data-dir: %v", lines)
 	}
 	if !containsArgPair(lines, "-m", "model-x") {
 		t.Errorf("missing -m: %v", lines)
@@ -633,58 +593,139 @@ func TestClineExecuteArgvSentinelAndStdinPayload(t *testing.T) {
 	}
 }
 
-// TestClineExecuteDiscoversSessionIDFromDataDir drives the real Execute path
-// with a fake CLI that writes real-shaped session JSON under Multica's
-// --data-dir and asserts Result.SessionID equals that resume id.
-func TestClineExecuteDiscoversSessionIDFromDataDir(t *testing.T) {
+func TestBuildClineResumeEnvUsesSharedHub(t *testing.T) {
+	t.Setenv("CLINE_HUB_HOST", "127.0.0.1")
+	t.Setenv("CLINE_HUB_PORT", "7777")
+	t.Setenv("CLINE_HUB_DISCOVERY_PATH", "/shared/production.json")
+	t.Setenv("CLINE_SESSION_BACKEND_MODE", "local")
+	t.Setenv("CLINE_VCR", "1")
+
+	env := buildClineEnv(map[string]string{
+		"CLINE_SESSION_BACKEND_MODE": "file",
+		"CLINE_VCR":                  "2",
+	}, true)
+	joined := "\n" + strings.Join(env, "\n") + "\n"
+	for _, want := range []string{
+		"CLINE_HUB_HOST=127.0.0.1",
+		"CLINE_HUB_PORT=7777",
+		"CLINE_HUB_DISCOVERY_PATH=/shared/production.json",
+		"CLINE_SESSION_BACKEND_MODE=hub",
+	} {
+		if !strings.Contains(joined, "\n"+want+"\n") {
+			t.Errorf("missing %q in env", want)
+		}
+	}
+	if strings.Contains(joined, "CLINE_VCR=") || strings.Contains(joined, "CLINE_SESSION_BACKEND_MODE=local") || strings.Contains(joined, "CLINE_SESSION_BACKEND_MODE=file") {
+		t.Fatalf("managed resume env was not sanitized: %s", joined)
+	}
+}
+
+func TestClineExecuteResumePreservesIDUnlessStructuredRejection(t *testing.T) {
 	t.Parallel()
-	// Real CLI shape: no sessionId on NDJSON; id only on disk.
+	const sessionID = "1784085932547_prior"
+
+	_, failed, argsFile := runClineWithStdout(t,
+		`{"type":"run_result","finishReason":"error","text":"provider unavailable"}`+"\n",
+		ExecOptions{ResumeSessionID: sessionID}, nil)
+	if failed.SessionID != sessionID || failed.ResumeRejected {
+		t.Fatalf("provider failure result = %+v", failed)
+	}
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsArg(splitNULArgs(raw), "--data-dir") {
+		t.Fatalf("resume argv contains --data-dir: %v", splitNULArgs(raw))
+	}
+
+	_, rejected, _ := runClineWithStdout(t,
+		`{"type":"run_result","finishReason":"error","code":"session_not_found","text":"missing"}`+"\n",
+		ExecOptions{ResumeSessionID: sessionID}, nil)
+	if rejected.SessionID != "" || !rejected.ResumeRejected {
+		t.Fatalf("structured rejection result = %+v", rejected)
+	}
+}
+
+func TestClineExecuteFreshIgnoresResumeRejectionCode(t *testing.T) {
+	t.Parallel()
+	sessionTimestamp := time.Now().Add(500 * time.Millisecond).UnixMilli()
+	firstProtocolTimestamp := sessionTimestamp + 500
+	wantID := fmt.Sprintf("%d_fresh", sessionTimestamp)
 	ndjson := strings.Join([]string{
-		`{"type":"hook_event","event":{"type":"agent_start","taskId":"conv_abc","agentId":"agent_xyz"}}`,
-		`{"type":"agent_event","event":{"type":"content_end","contentType":"text","text":"hi"}}`,
-		`{"type":"run_result","finishReason":"completed","text":"done","usage":{"inputTokens":1,"outputTokens":1}}`,
+		fmt.Sprintf(`{"type":"agent_event","ts":%d,"event":{"type":"iteration_start"}}`, firstProtocolTimestamp),
+		fmt.Sprintf(`{"type":"run_result","ts":%d,"finishReason":"completed","code":"session_replaced","text":"done"}`, firstProtocolTimestamp+1),
 	}, "\n")
-	wantID := "1784999999999_testhost"
+
+	cap := runClineExecute(t, "fresh run", ndjson, ExecOptions{Cwd: t.TempDir()}, map[string]string{
+		"CLINE_TEST_HISTORY_SESSION_ID": wantID,
+	})
+	if cap.result.SessionID != wantID || cap.result.ResumeRejected {
+		t.Fatalf("fresh result = %+v, want SessionID %q without resume rejection", cap.result, wantID)
+	}
+}
+
+func TestClineExecuteDiscoversSessionIDFromDedicatedHubHistory(t *testing.T) {
+	t.Parallel()
+	sessionTimestamp := time.Now().Add(500 * time.Millisecond).UnixMilli()
+	firstProtocolTimestamp := sessionTimestamp + 500
+	wantID := fmt.Sprintf("%d_testhost", sessionTimestamp)
+	ndjson := strings.Join([]string{
+		fmt.Sprintf(`{"type":"agent_event","ts":%d,"event":{"type":"iteration_start","iteration":1}}`, firstProtocolTimestamp),
+		fmt.Sprintf(`{"type":"agent_event","ts":%d,"event":{"type":"content_end","contentType":"text","text":"hi"}}`, firstProtocolTimestamp+1),
+		fmt.Sprintf(`{"type":"run_result","ts":%d,"finishReason":"completed","text":"done","usage":{"inputTokens":1,"outputTokens":1}}`, firstProtocolTimestamp+2),
+	}, "\n")
 	cwd := t.TempDir()
-	cap := runClineExecute(t, "discover me UNIQUE_DISK_PROMPT", ndjson, ExecOptions{
+	cap := runClineExecute(t, "discover me", ndjson, ExecOptions{
 		Cwd:   cwd,
-		Model: "m-disk",
+		Model: "m-history",
 	}, map[string]string{
-		"CLINE_WRITE_SESSION": "1",
-		"CLINE_SESSION_ID":    wantID,
+		"CLINE_TEST_HISTORY_SESSION_ID": wantID,
 	})
 	if cap.result.Status != "completed" {
 		t.Fatalf("status=%q error=%q", cap.result.Status, cap.result.Error)
 	}
 	if cap.result.SessionID != wantID {
-		t.Fatalf("SessionID=%q, want disk session %q (not empty, not conv_/agent_)", cap.result.SessionID, wantID)
+		t.Fatalf("SessionID=%q, want history session %q", cap.result.SessionID, wantID)
 	}
-	if strings.HasPrefix(cap.result.SessionID, "conv_") || strings.HasPrefix(cap.result.SessionID, "agent_") {
-		t.Fatalf("SessionID looks like hook task/agent id: %q", cap.result.SessionID)
+	if cap.hubStarts != 1 || cap.hubStops != 1 || cap.historyCalls < 2 {
+		t.Fatalf("fresh lifecycle: starts=%d stops=%d history=%d", cap.hubStarts, cap.hubStops, cap.historyCalls)
 	}
-	// Confirm Multica passed --data-dir and fake wrote under it.
 	raw, err := os.ReadFile(cap.argsFile)
 	if err != nil {
 		t.Fatalf("read args: %v", err)
 	}
 	lines := splitNULArgs(raw)
-	dataDir := argValueAfter(lines, "--data-dir")
-	if dataDir == "" {
-		t.Fatalf("missing --data-dir in argv: %v", lines)
+	if containsArg(lines, "--data-dir") {
+		t.Fatalf("fresh argv contains --data-dir: %v", lines)
 	}
-	sessionPath := filepath.Join(dataDir, "data", "sessions", wantID, wantID+".json")
-	if _, err := os.Stat(sessionPath); err != nil {
-		t.Fatalf("expected fake CLI session file at %s: %v", sessionPath, err)
+	envRaw, err := os.ReadFile(cap.envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"CLINE_HUB_HOST=127.0.0.1",
+		"CLINE_HUB_PORT=32145",
+		"CLINE_SESSION_BACKEND_MODE=hub",
+	} {
+		if !strings.Contains(string(envRaw), want+"\n") {
+			t.Errorf("fresh task env missing %q", want)
+		}
+	}
+	var pinned bool
+	for _, message := range cap.messages {
+		if message.Type == MessageStatus && message.SessionID == wantID {
+			pinned = true
+		}
+	}
+	if !pinned {
+		t.Fatalf("missing early/final SessionID status: %+v", cap.messages)
 	}
 	if cap.result.Output != "done" {
 		t.Errorf("output=%q, want done", cap.result.Output)
 	}
 }
 
-// TestClineExecuteEmptySessionIDWithoutDiskSession asserts that when the
-// fake CLI emits only NDJSON (no session JSON under data-dir), Result.SessionID
-// stays empty without panic — even if NDJSON carries synthetic sessionId.
-func TestClineExecuteEmptySessionIDWithoutDiskSession(t *testing.T) {
+func TestClineExecuteEmptySessionIDWithoutExactHistoryCandidate(t *testing.T) {
 	t.Parallel()
 	ndjson := strings.Join([]string{
 		`{"type":"hook_event","event":{"type":"agent_start"},"sessionId":"ses_stream_only"}`,
@@ -695,83 +736,18 @@ func TestClineExecuteEmptySessionIDWithoutDiskSession(t *testing.T) {
 		t.Fatalf("status=%q error=%q", result.Status, result.Error)
 	}
 	if result.SessionID != "" {
-		t.Fatalf("SessionID=%q, want empty when no disk session file", result.SessionID)
+		t.Fatalf("SessionID=%q, want empty without exact history candidate", result.SessionID)
 	}
 	if result.Output != "ok" {
 		t.Errorf("output=%q", result.Output)
 	}
-	// Still passed isolated --data-dir (empty tree).
 	raw, err := os.ReadFile(argsFile)
 	if err != nil {
 		t.Fatalf("read args: %v", err)
 	}
-	if !containsArg(splitNULArgs(raw), "--data-dir") {
-		t.Errorf("expected --data-dir even when no session written: %v", splitNULArgs(raw))
+	if containsArg(splitNULArgs(raw), "--data-dir") {
+		t.Errorf("unexpected --data-dir: %v", splitNULArgs(raw))
 	}
-}
-
-func TestDiscoverClineSessionIDUnit(t *testing.T) {
-	t.Parallel()
-	dataDir := t.TempDir()
-	sid := "1784085932547_muen6"
-	cwd := "/work/project"
-	sessionDir := filepath.Join(dataDir, "data", "sessions", sid)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	body := `{
-  "session_id": "` + sid + `",
-  "pid": 4242,
-  "cwd": "` + cwd + `",
-  "workspace_root": "` + cwd + `",
-  "prompt": "<user_input mode=\"act\">hello task</user_input>",
-  "started_at": "2026-07-15T12:00:00.000Z",
-  "ended_at": "2026-07-15T12:00:01.000Z",
-  "status": "completed"
-}`
-	if err := os.WriteFile(filepath.Join(sessionDir, sid+".json"), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	start := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	got := discoverClineSessionID(dataDir, clineSessionMatchHints{
-		PID:       4242,
-		Cwd:       cwd,
-		Prompt:    "hello task",
-		StartTime: start,
-		EndTime:   start.Add(2 * time.Second),
-	}, slog.Default())
-	if got != sid {
-		t.Fatalf("discover = %q, want %q", got, sid)
-	}
-
-	// Reject conv_/agent_ prefixes even if present as session_id field.
-	badDir := t.TempDir()
-	badSID := "conv_not_resume"
-	badSessionDir := filepath.Join(badDir, "data", "sessions", badSID)
-	if err := os.MkdirAll(badSessionDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	badBody := `{"session_id":"conv_not_resume","pid":1,"cwd":"/x","prompt":"p","status":"completed"}`
-	if err := os.WriteFile(filepath.Join(badSessionDir, badSID+".json"), []byte(badBody), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got := discoverClineSessionID(badDir, clineSessionMatchHints{PID: 1}, slog.Default()); got != "" {
-		t.Fatalf("expected empty for conv_ id, got %q", got)
-	}
-
-	// Empty data-dir → empty id.
-	if got := discoverClineSessionID(t.TempDir(), clineSessionMatchHints{}, slog.Default()); got != "" {
-		t.Fatalf("empty tree: got %q", got)
-	}
-}
-
-func argValueAfter(args []string, flag string) string {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == flag {
-			return args[i+1]
-		}
-	}
-	return ""
 }
 
 func TestClineExecuteStdinTaskOnlyNoBrief(t *testing.T) {
@@ -813,7 +789,7 @@ func TestClineProcessEventsUnit(t *testing.T) {
 		`{"type":"run_result","finishReason":"max_iterations","text":"stopped early"}`,
 		`{"type":"run_result","finishReason":"completed","text":"last wins"}`,
 	}, "\n")
-	res := b.processEvents(strings.NewReader(ndjson), ch)
+	res := b.processEvents(context.Background(), strings.NewReader(ndjson), ch)
 	close(ch)
 	if !res.sawRunResult {
 		t.Fatal("expected sawRunResult")
@@ -823,6 +799,305 @@ func TestClineProcessEventsUnit(t *testing.T) {
 	}
 	if res.output != "last wins" {
 		t.Errorf("output=%q", res.output)
+	}
+}
+
+func TestClineProcessEventsFreezesFirstProtocolTimestamp(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 1)
+	ndjson := strings.Join([]string{
+		`{"type":"unknown","ts":1784085932500}`,
+		`{"type":"agent_event","ts":1784085932547,"event":{"type":"iteration_start"}}`,
+		`{"type":"run_result","ts":1784085999999,"finishReason":"completed"}`,
+	}, "\n")
+	res := b.processEvents(context.Background(), strings.NewReader(ndjson), ch)
+	if res.firstProtocolTimestampMs != 1784085932547 {
+		t.Fatalf("first timestamp = %d", res.firstProtocolTimestampMs)
+	}
+	if !res.sawIterationStart {
+		t.Fatal("iteration_start was not observed")
+	}
+}
+
+func TestClineProcessEventsReportsLookupTriggersBeforeEOF(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	reader, writer := io.Pipe()
+	observed := make(chan clineProtocolObservation, 2)
+	done := make(chan clineScanResult, 1)
+	go func() {
+		done <- b.processEventsObserved(context.Background(), reader, make(chan Message, 1), func(observation clineProtocolObservation) {
+			observed <- observation
+		})
+	}()
+	if _, err := io.WriteString(writer, `{"type":"agent_event","ts":1784085932547,"event":{"type":"iteration_start","iteration":1}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	first := <-observed
+	second := <-observed
+	if first.FirstTimestampMs != 1784085932547 || first.IterationStarted {
+		t.Fatalf("first observation = %+v", first)
+	}
+	if !second.IterationStarted || second.FirstTimestampMs != 0 {
+		t.Fatalf("second observation = %+v", second)
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("scanner returned before EOF: %+v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	if result.firstProtocolTimestampMs != 1784085932547 || !result.sawIterationStart {
+		t.Fatalf("scan result = %+v", result)
+	}
+}
+
+func TestClineProcessEventsContentSnapshotsAndThinking(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 16)
+	ndjson := strings.Join([]string{
+		`{"type":"agent_event","event":{"type":"content_start","contentType":"thinking","contentBlockId":"r1"}}`,
+		`{"type":"agent_event","event":{"type":"content_update","contentType":"thinking","contentBlockId":"r1","snapshot":" reason"}}`,
+		`{"type":"agent_event","event":{"type":"content_end","contentType":"thinking","contentBlockId":"r1","snapshot":" reasoned\n"}}`,
+		`{"type":"agent_event","event":{"type":"content_start","contentType":"text","contentBlockId":"t1"}}`,
+		`{"type":"agent_event","event":{"type":"content_update","contentType":"text","contentBlockId":"t1","delta":" answer"}}`,
+		`{"type":"agent_event","event":{"type":"content_end","contentType":"text","contentBlockId":"t1","snapshot":" answer\n"}}`,
+	}, "\n")
+
+	res := b.processEvents(context.Background(), strings.NewReader(ndjson), ch)
+	close(ch)
+	var thinking, text strings.Builder
+	for msg := range ch {
+		switch msg.Type {
+		case MessageThinking:
+			thinking.WriteString(msg.Content)
+		case MessageText:
+			text.WriteString(msg.Content)
+		}
+	}
+	if got := thinking.String(); got != " reasoned\n" {
+		t.Fatalf("thinking = %q, want preserved deduplicated snapshot", got)
+	}
+	if got := text.String(); got != " answer\n" {
+		t.Fatalf("text = %q, want preserved delta plus snapshot suffix", got)
+	}
+	if res.output != " answer\n" {
+		t.Fatalf("output = %q", res.output)
+	}
+}
+
+func TestClineProcessEventsCline3046AgentContract(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 16)
+	ndjson := strings.Join([]string{
+		`{"type":"agent_event","ts":"2026-07-24T10:00:00.100Z","event":{"type":"content_start","contentType":"reasoning","reasoning":"inspect "}}`,
+		`{"type":"agent_event","ts":"2026-07-24T10:00:00.200Z","event":{"type":"content_end","contentType":"reasoning","reasoning":"inspect repo"}}`,
+		`{"type":"agent_event","ts":"2026-07-24T10:00:00.300Z","event":{"type":"content_start","contentType":"text","text":"answer "}}`,
+		`{"type":"agent_event","ts":"2026-07-24T10:00:00.400Z","event":{"type":"content_end","contentType":"text","text":"answer done"}}`,
+		`{"type":"agent_event","event":{"type":"error","error":{"name":"ProviderError","message":"queue unavailable"},"recoverable":true,"iteration":1}}`,
+		`{"type":"run_result","finishReason":"completed","text":"answer done"}`,
+	}, "\n")
+
+	res := b.processEvents(context.Background(), strings.NewReader(ndjson), ch)
+	close(ch)
+	var got []Message
+	for msg := range ch {
+		got = append(got, msg)
+	}
+	if len(got) != 5 {
+		t.Fatalf("messages = %d, want 5: %+v", len(got), got)
+	}
+	wants := []struct {
+		type_   MessageType
+		content string
+	}{
+		{MessageThinking, "inspect "},
+		{MessageThinking, "repo"},
+		{MessageText, "answer "},
+		{MessageText, "done"},
+		{MessageError, "queue unavailable"},
+	}
+	for i, want := range wants {
+		if got[i].Type != want.type_ || got[i].Content != want.content {
+			t.Errorf("message[%d] = %+v, want type=%s content=%q", i, got[i], want.type_, want.content)
+		}
+	}
+	if res.output != "answer done" || res.firstProtocolTimestampMs != 1784887200100 {
+		t.Fatalf("scan result = %+v", res)
+	}
+}
+
+func TestClineProcessEventsPairsConcurrentToolsByCallID(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 16)
+	ndjson := strings.Join([]string{
+		`{"type":"hook_event","event":{"type":"tool_call","toolName":"read","toolCallId":"a","input":"{\"path\":\"a.txt\"}"}}`,
+		`{"type":"hook_event","event":{"type":"tool_call","toolName":"write","toolCallId":"b","input":{"path":"b.txt"}}}`,
+		`{"type":"hook_event","event":{"type":"tool_result","toolCallId":"b","output":{"stdout":"wrote b","stderr":""}}}`,
+		`{"type":"hook_event","event":{"type":"tool_result","toolCallId":"a","output":"read a\n"}}`,
+	}, "\n")
+
+	b.processEvents(context.Background(), strings.NewReader(ndjson), ch)
+	close(ch)
+	var got []Message
+	for msg := range ch {
+		got = append(got, msg)
+	}
+	if len(got) != 4 {
+		t.Fatalf("messages = %d, want 4: %+v", len(got), got)
+	}
+	if got[0].CallID != "a" || got[0].Tool != "read" || got[0].Input["path"] != "a.txt" {
+		t.Fatalf("first tool use = %+v", got[0])
+	}
+	if got[2].CallID != "b" || got[2].Tool != "write" || !strings.Contains(got[2].Output, "wrote b") {
+		t.Fatalf("first tool result = %+v", got[2])
+	}
+	if got[3].CallID != "a" || got[3].Tool != "read" || got[3].Output != "read a\n" {
+		t.Fatalf("second tool result = %+v", got[3])
+	}
+}
+
+func TestClineProcessEventsNestedHookPayloads(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 8)
+	ndjson := strings.Join([]string{
+		`{"type":"hook_event","event":{"hookName":"tool_call","tool_call":{"id":"call-1","name":"execute_command","input":{"command":"pwd"}}}}`,
+		`{"type":"hook_event","event":{"hookName":"tool_result","tool_result":{"id":"call-1","name":"execute_command","input":{"command":"pwd"},"output":{"stdout":"/work\n","stderr":""},"durationMs":5}}}`,
+		`{"type":"hook_event","event":{"hookName":"tool_call","tool_call":{"id":"call-2","name":"read_file","input":"{\"path\":\"a.txt\"}"}}}`,
+		`{"type":"hook_event","event":{"hookName":"tool_result","tool_result":{"id":"call-2","name":"read_file","output":null,"error":"permission denied","durationMs":2}}}`,
+	}, "\n")
+	b.processEvents(context.Background(), strings.NewReader(ndjson), ch)
+	close(ch)
+	var got []Message
+	for msg := range ch {
+		got = append(got, msg)
+	}
+	if len(got) != 4 {
+		t.Fatalf("messages = %d, want 4: %+v", len(got), got)
+	}
+	if got[0].Type != MessageToolUse || got[0].CallID != "call-1" || got[0].Tool != "execute_command" || got[0].Input["command"] != "pwd" {
+		t.Fatalf("tool use = %+v", got[0])
+	}
+	if got[1].Type != MessageToolResult || got[1].CallID != "call-1" || !strings.Contains(got[1].Output, `"stdout":"/work\n"`) {
+		t.Fatalf("tool result = %+v", got[1])
+	}
+	if got[2].Input["path"] != "a.txt" || got[3].Output != "permission denied" {
+		t.Fatalf("string input/error result = %+v / %+v", got[2], got[3])
+	}
+}
+
+func TestClineProcessEventsBackpressureDoesNotDropBurst(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	const count = 600
+	var ndjson strings.Builder
+	for i := 0; i < count; i++ {
+		fmt.Fprintf(&ndjson, "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_update\",\"contentType\":\"text\",\"contentBlockId\":\"%d\",\"delta\":\"x\"}}\n", i)
+	}
+	ch := make(chan Message, 1)
+	done := make(chan clineScanResult, 1)
+	go func() {
+		done <- b.processEvents(context.Background(), strings.NewReader(ndjson.String()), ch)
+		close(ch)
+	}()
+
+	got := 0
+	for range ch {
+		got++
+	}
+	<-done
+	if got != count {
+		t.Fatalf("messages = %d, want %d", got, count)
+	}
+}
+
+func TestClineProcessEventsCancellationUnblocksBackpressure(t *testing.T) {
+	t.Parallel()
+	b := &clineBackend{cfg: Config{Logger: slog.Default()}}
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan Message)
+	done := make(chan clineScanResult, 1)
+	go func() {
+		done <- b.processEvents(ctx, strings.NewReader(strings.Join([]string{
+			`{"type":"agent_event","event":{"type":"usage","inputTokens":12,"outputTokens":3}}`,
+			`{"type":"agent_event","event":{"type":"content_update","contentType":"text","delta":"x"}}`,
+		}, "\n")), ch)
+	}()
+	cancel()
+	select {
+	case result := <-done:
+		if result.status != "aborted" || result.usage.InputTokens != 12 || result.usage.OutputTokens != 3 {
+			t.Fatalf("cancelled scan result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("processEvents stayed blocked after cancellation")
+	}
+}
+
+func TestClineExecuteStreamsToolEventBeforeProcessExit(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	fakePath := filepath.Join(tempDir, "cline")
+	releasePath := filepath.Join(tempDir, "release")
+	writeTestExecutable(t, fakePath, []byte(`#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"agent_event","event":{"type":"content_update","contentType":"thinking","delta":"checking"}}'
+printf '%s\n' '{"type":"hook_event","event":{"type":"tool_call","toolName":"bash","toolCallId":"call-1","input":{"command":"pwd"}}}'
+while [ ! -f "$CLINE_RELEASE_FILE" ]; do sleep 0.01; done
+printf '%s\n' '{"type":"hook_event","event":{"type":"tool_result","toolName":"bash","toolCallId":"call-1","output":"done"}}'
+printf '%s\n' '{"type":"run_result","finishReason":"completed","text":"finished"}'
+`))
+	backend, err := New("cline", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"CLINE_RELEASE_FILE": releasePath},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt", ExecOptions{ResumeSessionID: "1784085932547_prior"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []MessageType{MessageThinking, MessageToolUse} {
+		select {
+		case message := <-session.Messages:
+			if message.Type != want {
+				t.Fatalf("message type = %q, want %q: %+v", message.Type, want, message)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("did not receive %s before process exit", want)
+		}
+	}
+	select {
+	case result := <-session.Result:
+		t.Fatalf("process exited before release: %+v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range session.Messages {
+	}
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" || result.Output != "finished" {
+			t.Fatalf("result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("result did not arrive after release")
 	}
 }
 

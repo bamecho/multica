@@ -1,16 +1,25 @@
 # 01 — Cline Session ID via Data-Dir Discovery
 
-**Status:** Implemented (2026-07-15) — P0 complete:
+**Status:** **Obsolete (2026-07-24). Do not implement.** Superseded by the
+confirmed [`04-cline-dedicated-hub-per-run.md`](./04-cline-dedicated-hub-per-run.md).
+
+This file is retained only as a historical record of the temporary
+`--data-dir` and settings-seed approach. All current Cline launch, prompt,
+session discovery, and resume decisions live in plan 04.
+
+Historical note: P0 was implemented (2026-07-15) as:
 
 - Isolated `--data-dir` + post-exit disk discovery for `Result.SessionID`
 - Auth via **seed** of `~/.cline-sr/data/settings` into the data-dir (sandbox ignores `--config` for providers)
 - No `--config` on Multica argv
 
-P1 (persist data-dir / verified `--id` resume) not done.
+P1 (persist data-dir / verified `--id` resume) was never done. Forward work
+must follow plan 04.
 
-**Scope:** Obtain a resume-capable `sessionId` for Multica’s `cline` NDJSON backend  
+**Scope (historical):** Obtain a resume-capable `sessionId` for Multica’s `cline` NDJSON backend
 **Related:**
 
+- **Current design:** [`docs/plan/04-cline-dedicated-hub-per-run.md`](./04-cline-dedicated-hub-per-run.md)
 - [`docs/cline-ndjson-multica-adapter-plan.md`](../cline-ndjson-multica-adapter-plan.md) — overall adapter design
 - [`docs/cline-ndjson-probe.md`](../cline-ndjson-probe.md) — probe cookbook
 - [`docs/plan/02-cline-prompt-stdin-hybrid.md`](./02-cline-prompt-stdin-hybrid.md) — long prompt via stdin

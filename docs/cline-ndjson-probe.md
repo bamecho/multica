@@ -2,7 +2,11 @@
 
 Probe and capture notes for adapting a **Cline-based internal coding CLI** to Multica via **`--json` NDJSON** (not ACP / JSON-RPC).
 
-**Agreed adapter design (source of truth for implementation):** [`docs/cline-ndjson-multica-adapter-plan.md`](./cline-ndjson-multica-adapter-plan.md)
+**Confirmed launch/session design (source of truth):**
+[`docs/plan/04-cline-dedicated-hub-per-run.md`](./plan/04-cline-dedicated-hub-per-run.md)
+
+The examples below are probe notes. Where they conflict with plan 04, plan 04
+wins.
 
 **Confirmed shape:** Format **B** (Cline 3.x envelope), not the older Overview `say`/`ask` message form.
 
@@ -48,12 +52,14 @@ your-cli --json --auto-approve true \
   -t 120 \
   "Your prompt here"
 
-# Multica-shaped launch (matches server/pkg/agent/cline.go)
-# 1) Seed auth into data-dir first (sandbox ignores separate --config for providers):
-#    cp -a ~/.cline-sr/data/settings/. "$PER_TASK_STATE_DIR/settings/"
-#    mkdir -p "$PER_TASK_STATE_DIR/data/settings" && cp -a ~/.cline-sr/data/settings/. "$PER_TASK_STATE_DIR/data/settings/"
+# Multica-shaped fresh task launch after its dedicated Hub is ready.
 printf '%s' "$FULL_MULTICA_PAYLOAD" | your-cli --json \
-  --data-dir "$PER_TASK_STATE_DIR" \
+  -c "$WORKDIR" \
+  -m "$MODEL" \
+  $'\n'
+
+# Multica-shaped resume task uses Cline's normal long-lived shared Hub.
+printf '%s' "$FULL_MULTICA_PAYLOAD" | your-cli --json \
   -c "$WORKDIR" \
   -m "$MODEL" \
   --id "$PRIOR_SESSION_ID" \
@@ -70,13 +76,15 @@ Useful flags (open-source `cline --help` + Multica notes):
 | `-t, --timeout` | Seconds (`0` = no timeout); Multica uses daemon wall-clock instead |
 | `-s, --system` | System prompt override; Multica does **not** use it (stdin brief) |
 | `--id` | Resume session |
-| `--data-dir` | Isolated local state; **enables sandbox** (providers read under data-dir) |
+| `--data-dir` | Historical probe option; Multica's confirmed plan does **not** pass it |
 | `--config` | Settings dir when not sandboxed; **does not fix providers under `--data-dir`** |
 | `-m` / `-P` / `-k` | Model / provider / API key |
 | `--thinking` | Reasoning effort |
 | `--acp` | **Do not use** for Multica NDJSON path |
 
-**Auth under `--data-dir`:** seed `providers.json` from `~/.cline-sr/data/settings` into the data-dir before spawn. See [`docs/plan/01-cline-session-id-data-dir.md`](./plan/01-cline-session-id-data-dir.md).
+Multica uses Cline's persistent authenticated state and does not seed a
+temporary data directory. Fresh session correlation and shared-Hub resume
+routing are defined only in plan 04.
 
 ---
 
@@ -304,10 +312,12 @@ Fill after probing the internal binary.
 | Multica need | Internal NDJSON source (fill in) | Open-source default guess |
 | --- | --- | --- |
 | Streaming assistant text | | `agent_event.event.text` / content_* |
+| Thinking/reasoning | | content event distinguished by `contentType` or observed equivalent |
 | Tool start | | `hook_event` + `tool_call` |
 | Tool end | | `hook_event` + `tool_result` |
-| Tool name | | often **absent** → use `"tool"` |
-| Session id | | `run_result.sessionId` / CLI `--id` |
+| Tool name | | Probe all tool event variants and nested fields before declaring it absent |
+| Error event | | nested `error` event and terminal error fields |
+| Session id | | not authoritative from NDJSON; plan 04 history match or supplied `--id` |
 | Success | | last `run_result.finishReason == "completed"` |
 | Failure / abort | | `aborted` / `error` / non-zero exit |
 | Final output | | `run_result.text` or `done.text` |
@@ -320,10 +330,26 @@ Fill after probing the internal binary.
 1. Line-scan stdout; skip invalid JSON with a log line.
 2. `agent_event` with text → `MessageText` (dedupe partials if needed).
 3. `hook_event` tool_* → `MessageToolUse` / `MessageToolResult`.
-4. First session id → `MessageStatus` + pin for resume.
+4. Ignore stream session ids for fresh discovery. Fresh runs use plan 04's
+   exact history match; resumed runs already have Multica's supplied ID.
 5. **Last** `run_result` decides `Result`.
 6. If no `run_result`: fall back to last `done` + process exit code.
 7. Never call Multica HTTP from the Backend; business I/O stays `multica` CLI inside the agent env.
+
+For the exact Cline build used by Multica, a successful schema probe must
+additionally prove:
+
+- `tool_call` is flushed before tool execution and contains name, stable call ID,
+  and input;
+- `tool_result` reuses the call ID and contains output/error;
+- thinking/reasoning is distinguishable from ordinary text;
+- content updates have documented delta or snapshot semantics;
+- a reader sees each event before task process exit, including across a long
+  provider request or tool execution.
+
+The first implementation step is adapter mapping against these captured
+fixtures. Modify the internal fork only when the captures prove that a required
+field or flush boundary does not exist in the native NDJSON.
 
 ---
 
@@ -334,7 +360,7 @@ Fill after probing the internal binary.
 | Text chunk | `Message{Type: text, Content}` |
 | tool_call | `Message{Type: tool-use, Tool, CallID, Input}` |
 | tool_result | `Message{Type: tool-result, CallID, Output}` |
-| session id | `Message{Type: status, SessionID}` |
+| exact fresh history match | `Message{Type: status, SessionID}` |
 | `finishReason=completed` | `Result{Status: "completed", Output, Usage, SessionID}` |
 | aborted / error / timeout | `Result{Status: "failed"\|"timeout", Error, SessionID}` |
 

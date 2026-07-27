@@ -1,14 +1,15 @@
 # Cline 3.x NDJSON → Multica Adapter Plan
 
-**Status:** Implemented (Cline 3.x NDJSON Backend + daemon probe + migration 175 + stdin prompt + data-dir session discovery + settings seed)  
+**Status:** A base NDJSON parser exists, but execution-log parity is incomplete.
+Fresh-only dedicated-Hub discovery, shared-Hub resume, and fixture-driven event
+mapping are not complete until plan 04's acceptance tests pass.
 **Scope:** Adapt a Cline-based internal coding CLI to Multica via **`--json` NDJSON (形态 B / Cline 3.x)**  
 **Out of scope:** ACP (`--acp`), Codex-style JSON-RPC app-server, upstream contribution process  
 
 Related:
 
 - Probe / capture cookbook: [`docs/cline-ndjson-probe.md`](./cline-ndjson-probe.md)
-- Session id + sandbox auth seed: [`docs/plan/01-cline-session-id-data-dir.md`](./plan/01-cline-session-id-data-dir.md)
-- Long prompt via stdin: [`docs/plan/02-cline-prompt-stdin-hybrid.md`](./plan/02-cline-prompt-stdin-hybrid.md)
+- Confirmed launch/session/resume design: [`docs/plan/04-cline-dedicated-hub-per-run.md`](./plan/04-cline-dedicated-hub-per-run.md)
 - Fork long-lived branch sync patrol: [`docs/fork-sync-patrol.md`](./fork-sync-patrol.md)
 - Multica control plane: `server/internal/daemon/daemon.go` (`runTask`)
 - Backend contract: `server/pkg/agent/agent.go` (`Backend.Execute` → `Message` / `Result`)
@@ -29,10 +30,11 @@ Multica still does **not** call the LLM. Business reads/writes stay on `multica`
 | Fact | Decision impact |
 | --- | --- |
 | Wire format is **形态 B** (Cline 3.x envelopes) | Parse `agent_event` / `hook_event` / `run_result`, not Overview `say`/`ask` only |
-| Flags used by Multica | `--json`, `--data-dir`, `-c`, optional `-m` / `--id`; **not** `-t` / `-s` / `--config` / `--auto-approve` on argv |
-| **`-s` / system prompt not usable** | Do **not** pass `-s`; deliver brief on **stdin** with user prompt (plan 02) |
-| Real NDJSON has **no** resume `sessionId` | Discover from disk under `--data-dir` (plan 01) |
-| `--data-dir` enables **sandbox** | Provider path forced under data-dir; **seed** `~/.cline-sr/data/settings` (not `--config`) |
+| Flags used by Multica | `--json`, `-c`, optional `-m` / `--id`; **not** `-t` / `-s` / `--config` / `--auto-approve` / **`--data-dir`** on argv |
+| **`-s` / system prompt not usable** | Do **not** pass `-s`; deliver the full brief and user prompt on stdin; argv carries only a newline sentinel |
+| Real NDJSON has **no** resume `sessionId` | Fresh runs use a dedicated Hub and exact native-history matching; resume already has Multica's authoritative ID and uses the long-lived shared Hub |
+| `--data-dir` enables **sandbox** | **Do not pass it.** Cline owns one persistent state root across fresh and resumed runs |
+| Runtime routing can fall back locally | Force `CLINE_SESSION_BACKEND_MODE=hub`; Hub failure is fatal |
 | Prefer **simplest** reliable path | One `cline` Backend; internal binary name via Custom Runtime Profile |
 
 ---
@@ -69,20 +71,33 @@ Daemon  prepare workdir / skills / AGENTS.md (best-effort)
         runtimeBrief → ExecOptions.SystemPrompt  (inline path)
         agent.New("cline").Execute(...)
 Backend prep:
-          MkdirTemp data-dir
-          seed ~/.cline-sr/data/settings → <data-dir>/settings (+ data/settings)
+          if fresh:
+            allocate private Hub discovery path + loopback port
+            start and validate one dedicated Hub
+            snapshot native history
+          if resume:
+            use the normal long-lived shared Hub
+            do not create/start/status/stop a private Hub
+          force Hub backend; no Multica data-dir / settings seed
 Backend argv:
           <cli> --json
-                --data-dir <isolated>
                 -c <workdir>
                 [-m <model>]
                 [--id <prior_session>]
                 $'\n'                              # gate only; NO -s; no full prompt on argv
+                # do NOT pass --data-dir
 Backend stdin:
           SystemPrompt + "\n\n" + userPrompt
         parse stdout NDJSON → Message stream
-        after Wait: discover session_id from data-dir disk
-        last run_result → Result (+ SessionID from disk)
+        if fresh:
+          freeze first protocol timestamp
+          discover session_id by history delta + dedicated Hub PID + cwd + timestamp
+          early-pin exact-one match; final lookup never widens the time window
+          stop the owned Hub after session drain
+        if resume:
+          preserve the supplied ID unless positively rejected/replaced
+          never call, stop, or signal the shared Hub control plane
+        last run_result → Result
 Daemon  CompleteTask / FailTask (+ session_id, work_dir, usage)
 ```
 
@@ -96,9 +111,7 @@ Implementation **does not pass CLI `-t`**, to avoid dual-timeout semantics.
 ### 5.1 Required / used flags
 
 ```bash
-# Multica prep (not argv): seed settings into --data-dir (sandbox auth)
 cli --json \
-  --data-dir <isolated_temp> \
   -c <workdir> \
   [-m <model>] \
   [--id <session_id>] \
@@ -109,19 +122,21 @@ cli --json \
 | Flag / channel | Source | Notes |
 | --- | --- | --- |
 | `--json` | Fixed | NDJSON on stdout |
-| `--data-dir` | Multica temp under `TMPDIR` | Isolates sessions; enables CLI **sandbox** |
-| Settings seed | `~/.cline-sr/data/settings` | Copy into data-dir before spawn; `providers.json` required |
-| `--config` | **Not used** | Sandbox forces providers under data-dir; seed replaces this |
+| `--data-dir` | **Never passed** | Cline persistent state is required for resume |
+| Settings seed | **Removed** | Cline reads its authenticated persistent settings directly |
+| `--config` | **Not used** | The configured Cline installation owns settings |
 | `--auto-approve` | **Not passed** | CLI headless default is true; still blocked in CustomArgs |
 | `-c` | `opts.Cwd` | Also set `cmd.Dir` |
 | `-m` | `opts.Model` | Agent model or daemon default |
-| `--id` | `opts.ResumeSessionID` | Only when non-empty (P1: durable data-dir) |
-| argv prompt | Fixed `"\n"` | Gate only; see plan 02 |
+| `--id` | `opts.ResumeSessionID` | Only when non-empty and exact workdir reuse is allowed |
+| argv prompt | Fixed `"\n"` | Cline truthy-prompt gate only |
 | stdin | `SystemPrompt + "\n\n" + prompt` | Full Multica payload; replaces unusable `-s` and huge argv |
 | `-t` | **Not used (v1)** | Daemon timeout only |
 | `-s` | **Never** | Confirmed unsupported / unusable |
 
-Also filter `CustomArgs` / `ExtraArgs` so users cannot override `--json`, `--data-dir`, `--config`, `--auto-approve`, `-c`, `--id`, `-m` in ways that break the protocol.
+Also filter `CustomArgs` / `ExtraArgs` so users cannot override `--json`,
+`--data-dir`, `--config`, `--auto-approve`, `-c`, `--id`, `-m`, timeout,
+system prompt, or Hub routing in ways that break the protocol.
 
 ### 5.1.1 Ops prerequisite (auth)
 
@@ -131,7 +146,8 @@ Daemon host must have authenticated Cline settings before tasks run:
 ~/.cline-sr/data/settings/providers.json
 ```
 
-If missing, `Execute` fails closed with an error pointing at that path.
+If authentication is missing, Cline fails through its native persistent
+settings path. Multica does not create or seed a replacement settings tree.
 
 ### 5.2 Environment (Daemon already injects)
 
@@ -162,12 +178,14 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 
 | Source | Multica |
 | --- | --- |
-| `agent_event` with text (`event.text` / content blocks) | `Message{Type: text, Content}` |
-| `hook_event` + `tool_call` | `Message{Type: tool-use, Tool, CallID, Input}` — if name missing, `Tool="tool"` |
-| `hook_event` + `tool_result` | `Message{Type: tool-result, CallID, Output}` |
+| `agent_event` text content block | `Message{Type: text, Content}` with delta/snapshot deduplication |
+| `agent_event` thinking/reasoning content block | `Message{Type: thinking, Content}` |
+| NDJSON tool-start event | Normalize observed field aliases to `Message{Type: tool-use, Tool, CallID, Input}` |
+| NDJSON tool-end event | Normalize observed field aliases to `Message{Type: tool-result, Tool, CallID, Output}` |
+| NDJSON error event | `Message{Type: error, Content}` |
 | `agent_event.event.type == "usage"` | Accumulate `TokenUsage` |
-| Session id on NDJSON (if any) | **Ignored for `Result.SessionID`** — real CLI does not emit resume ids; disk under `--data-dir` is authoritative (plan 01) |
-| **Last** `run_result` with `finishReason == "completed"` | `Result{Status: "completed", Output: text, Usage}` + `SessionID` from disk discovery |
+| Session id on NDJSON (if any) | **Ignored for `Result.SessionID`** — plan 04's exact native-history match is authoritative |
+| **Last** `run_result` with `finishReason == "completed"` | `Result{Status: "completed", Output: text, Usage}` + exact-history ID for fresh runs or the supplied ID for resume |
 | Last `run_result` with other `finishReason` (`aborted`, `error`, …) | `failed` (or `timeout` if stderr indicates timeout) |
 | No `run_result` | Fallback: last `done` + process exit code |
 | stderr JSON / text matching timeout | Prefer `Result.Status = "timeout"` |
@@ -177,9 +195,31 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 1. Line-scan stdout; large scanner buffer (same order as other backends).  
 2. Prefer **last** `run_result` over mid-stream `done` for status and final `Output`.  
 3. Empty `Output` with `completed` is valid (work may be only `multica` side effects).  
-4. Tool name/path often **absent** in Cline 3.x hooks — do not fail; generic tool label is enough.  
-5. No fancy partial-dedup in v1; streaming text + correct terminal state is enough.  
-6. Resume: pass `--id` when `ResumeSessionID` set; if SessionID empty or resume fails, Daemon’s existing fresh-session retry applies. P1: durable data-dir for true resume.
+4. Build the field map from sanitized output captured from the exact Cline
+   version Multica runs. Normalize existing aliases and nested shapes in the
+   adapter; do not require a Cline protocol change for data already present.
+5. Track content per block. Preserve whitespace, map reasoning separately, and
+   convert cumulative snapshots to suffix deltas so the execution log does not
+   repeat text.
+6. Resume: pass `--id` when `ResumeSessionID` is set and preserve it unless
+   Cline positively reports rejection or replacement.
+7. Every NDJSON line must be flushed before a provider request or tool execution
+   can block. Events must reach `Session.Messages` before process exit, then use
+   the existing daemon `ReportTaskMessages` path for DB + WebSocket delivery.
+8. Pair tools with explicit call IDs or another probe-confirmed correlation
+   field and an in-flight map. A single `lastToolCallID` is invalid when calls
+   overlap.
+9. Do not use the lossy shared `trySend` behavior for Cline execution events.
+   Backpressure must be context-cancellable, and a burst larger than the channel
+   capacity must not disappear from the execution log.
+10. Unknown/malformed events are logged by type/keys without sensitive values
+    and do not fail the task. Generic `"tool"` is diagnostic fallback only, not
+    the accepted steady-state display.
+
+If the captured NDJSON truly lacks a required semantic field or is buffered
+until process exit, record that as a Cline protocol gap and make the smallest
+upstream/fork change. This is a fallback after adapter coverage, not the default
+implementation strategy.
 
 ### 6.4 Illustrative stream (reference only)
 
@@ -187,8 +227,8 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 {"type":"hook_event","event":{"type":"agent_start"}}
 {"type":"agent_event","event":{"type":"iteration_start","iteration":1}}
 {"type":"agent_event","event":{"type":"content_end","contentType":"text","text":"Working..."}}
-{"type":"hook_event","event":{"type":"tool_call"}}
-{"type":"hook_event","event":{"type":"tool_result"}}
+{"type":"hook_event","event":{"type":"tool_call","name":"bash","callId":"c1","input":{"command":"pwd"}}}
+{"type":"hook_event","event":{"type":"tool_result","name":"bash","callId":"c1","output":"/work\n"}}
 {"type":"agent_event","event":{"type":"usage","inputTokens":100,"outputTokens":20}}
 {"type":"agent_event","event":{"type":"done","reason":"completed","text":"Summary","iterations":1}}
 {"type":"run_result","finishReason":"completed","text":"Summary","durationMs":1234,"usage":{"inputTokens":100,"outputTokens":20}}
@@ -201,7 +241,7 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 | Mechanism | Role |
 | --- | --- |
 | `providerNeedsInlineSystemPrompt("cline") == true` | Daemon sets `ExecOptions.SystemPrompt = runtimeBrief` |
-| Backend stdin payload | **Required** — `SystemPrompt + "\n\n" + userPrompt` (plan 02); argv is only `"\n"` |
+| Backend stdin payload | **Required** — `SystemPrompt + "\n\n" + userPrompt`; argv is only `"\n"` |
 | Write `AGENTS.md` via `InjectRuntimeConfig` | Best-effort secondary; not relied on |
 | Skills dir | v1: default `.agent_context/skills/` until a native Cline project skill path is confirmed |
 
@@ -209,7 +249,7 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 
 ## 8. Implementation checklist
 
-### 8.1 Required for a working path (done)
+### 8.1 Required for the complete path
 
 | Area | Change |
 | --- | --- |
@@ -221,9 +261,13 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 | Brief file | `runtimeConfigPath` → `AGENTS.md` for `cline` |
 | DB | migration widen `runtime_profile.protocol_family` CHECK with `cline` |
 | Display name | optional override e.g. `Cline` in `runtimeDisplayNameOverrides` |
-| Stdin prompt | argv `"\n"` + full payload on stdin (plan 02) |
-| Data-dir session | isolated `--data-dir` + disk `session_id` discovery (plan 01) |
-| Settings seed | copy `~/.cline-sr/data/settings` into data-dir; no `--config` |
+| Stdin prompt | argv `"\n"` + full payload on stdin; consolidated in plan 04 |
+| Dedicated Hub | One private Hub/discovery identity per fresh invocation only |
+| Session discovery | Exact history delta + Hub PID + root fields + cwd + frozen timestamp window |
+| Persistent state | No temporary data-dir and no settings seed |
+| Early pin | Persist the first exact match while the task is still running |
+| Execution events | Named tool/input/result, thinking, text, and errors stream and flush before task completion |
+| Resume path | When Multica supplies a SessionID, use the long-lived shared Hub, skip all private-Hub/history/timestamp work, and use `--id` directly |
 
 ### 8.2 Deferred (do not block current path)
 
@@ -232,12 +276,13 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 - CLI `-t` passthrough  
 - Native Cline skill directory layout (if later confirmed)  
 - Docs row in `CLI_AND_DAEMON.md` (nice-to-have)  
-- **P1:** durable data-dir + verified `--id` resume under `--json`  
 
 ### 8.3 Explicit non-goals
 
 - ACP host  
 - File-level timeline from stream (use git outside if needed)  
+- Separate Hub-to-dashboard event bridge; task stdout NDJSON already feeds the
+  existing daemon task-message/WebSocket pipeline
 - Falling back to daemon PAT as agent token  
 - Opening PRs to upstream unless explicitly requested  
 - Relying on `--config` alone under `--data-dir` sandbox for provider auth  
@@ -246,13 +291,32 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 
 ## 9. Verification plan
 
-1. **Unit:** fixture NDJSON (success, tool hooks, aborted, missing `run_result`, bad lines) → assert `Message` sequence and `Result`.  
-2. **Unit:** seed `providers.json` into data-dir layouts; argv has no `--config`; SessionID from disk only.  
-3. **Local daemon:** `MULTICA_CLINE_PATH=... multica daemon start --foreground` with authenticated `~/.cline-sr`.  
-4. **Happy path:** assign a read-only / low-risk issue → claim → stream → complete.  
-5. **Resume (P1):** second task with `--id` / `prior_session_id` after durable data-dir.  
-6. **Custom profile:** same Backend with non-default `command_name`.  
-7. **Regression:** `go test ./pkg/agent/ -run Cline` and SupportedTypes lockstep tests.
+1. **Unit:** captured fixture NDJSON for text/thinking, delta and snapshot
+   content, serial and interleaved tools, errors, usage, aborted, missing
+   `run_result`, and bad lines -> assert exact `Message` sequence and `Result`.
+2. **Unit:** emit more than 256 events while the consumer is temporarily slow;
+   assert no Cline event is silently dropped and cancellation releases any
+   blocked sender.
+3. **Unit:** block between tool start/result and assert `tool_use` reaches the
+   consumer before the process exits; interleave two call IDs and assert each
+   result retains the correct tool.
+4. **Unit:** fresh dedicated-Hub environment, no `--data-dir`, frozen timestamp
+   window, exact-one matching, early pin, fail-closed ambiguity, plus a resume
+   branch that never starts/stops a private Hub and preserves its ID.
+5. **Integration:** concurrent fresh dedicated Hubs and long-lived shared-Hub
+   resume against one persistent SQLite state root; no local or file-backend
+   fallback.
+6. **Local daemon:** `MULTICA_CLINE_PATH=... multica daemon start --foreground` with authenticated persistent Cline settings.
+7. **Happy path:** assign a read-only / low-risk issue -> claim -> observe
+   thinking/text and each tool start/result in the execution log before task
+   completion -> complete.
+8. **Resume:** second task with `--id` / `prior_session_id` and exact workdir
+   reuse on the long-lived shared Hub; no private Hub command runs.
+9. **Crash/cancel:** fresh owner lease aborts the dedicated session; resume
+   cancellation only terminates the task CLI, whose disconnect aborts its own
+   turn without any Multica shared-Hub control call.
+10. **Custom profile:** same Backend with non-default `command_name`.
+11. **Regression:** `go test ./pkg/agent/ -run Cline` and SupportedTypes lockstep tests.
 
 ---
 
@@ -278,9 +342,15 @@ Authoritative shapes follow open-source Cline 3.x + [`docs/cline-ndjson-probe.md
 | 2026-07-15 | `Result.SessionID` from **disk** under `--data-dir`, not NDJSON (plan 01) |
 | 2026-07-15 | `--data-dir` enables sandbox; **seed** `~/.cline-sr/data/settings`; **do not pass `--config`** |
 | 2026-07-15 | Do not pass `--auto-approve` (CLI default true); still block CustomArgs override |
+| 2026-07-24 | Plans 01-03 retired; plan 04 is the sole source of truth |
+| 2026-07-24 | Fresh runs use one dedicated Hub plus exact Hub-PID/time matching; `--id` resume uses the long-lived shared Hub and skips private-Hub discovery |
+| 2026-07-24 | Execution-log visibility is fixture-driven Multica NDJSON adapter work; change Cline events only when native NDJSON lacks required semantics or timely flush |
 
 ---
 
 ## 12. Next step after this doc
 
-§8.1 is implemented on the fork branch (`server/pkg/agent/cline.go`, daemon probe, migration `9001_runtime_profile_add_cline`, stdin + data-dir seed). Use §5–§6 and plans 01/02 as the source of truth when changing behavior; update this file’s **Status** line and decision log when decisions change. P1 remains durable resume.
+The base NDJSON adapter exists, but its current temporary-data-dir discovery
+path is legacy implementation. Implement and verify plan 04 before treating
+fresh SessionID discovery and shared-Hub resume as complete. Plan 04 is the only
+source of truth for future Cline behavior changes.
